@@ -101,6 +101,8 @@ Jedes Modul wird mit pyflakes geprüft.
 ![Startseite während einer Prüfung](../bilder/kontrollzentrum/09-startseite-einfach-laeuft.png)
 ![Ergebnis in einfacher Sprache](../bilder/kontrollzentrum/10-ergebnis-klartext.png)
 
+**Messung gegen die Übungsmaschine (acht bekannte Befunde):** Im ersten Lauf fand das Programm 6 von 8. Zwei Lücken lagen an meiner Übungsseite (falsche Anführungszeichen beim WordPress-Hinweis, reiner Text statt HTML bei der Versionsseite). Nach der Korrektur fand es 7 von 8. Offen bleibt die PHP-Version, die das Werkzeug für bekannte Lücken nicht erkennt.
+
 **Echter Lauf (ehrlich):** Die Schnell-Prüfung lief gegen die eigene Übungsmaschine. Alle drei Schritte liefen durch.
 Gefunden wurden drei Software-Angaben (Apache, HTTP-Server, WordPress), keine Lücke mit hoher Dringlichkeit.
 Das Werkzeug für bekannte Lücken fand auf dieser Maschine nichts. Das ist ein Messergebnis, kein Fehler.
