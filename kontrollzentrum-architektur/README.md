@@ -89,6 +89,22 @@ Jedes Modul wird mit pyflakes geprüft.
 - **Test gegen einen eigenen Server aus dem Internet:** Die Firewall lässt nur SSH durch. Der Scan findet genau diesen einen Port und schlägt keinen Webschritt vor. Ein Passwort-Test gegen SSH wurde bewusst weggelassen, weil der Server nach Fehlversuchen sperrt.
 - **Noch offen:** Playbooks (feste Abfolgen mit Verzweigung), eine Ansicht für den Vergleich zweier Stände, und die Messung gegen eine richtige Übungsmaschine.
 
+## Einfache Bedienung (Stand: zweite Umbaurunde)
+
+- **Startseite:** „Was möchtest du prüfen?“ mit fünf Kategorien (Website, Netzwerk, WLAN, Dateien & Passwörter, Berichte).
+  Darunter drei empfohlene Prüfungen mit Erklärung und ungefährer Dauer. Technische Bereiche liegen hinter „Erweitert“.
+- **Vorschau vor jeder Prüfung:** Ziel, erlaubter Umfang, Schritte (mit Hinweis, wenn ein Werkzeug fehlt), Dauer und mögliche Auswirkungen.
+  Der Start bleibt gesperrt, bis die Erlaubnis bestätigt und das Häkchen gesetzt ist. Der Umfang wird vor **jedem** Schritt erneut geprüft.
+- **Ablauf:** Fortschritt („Schritt 2 von 3“), Uhr und Stopp-Taste. Ein fehlendes Werkzeug wird übersprungen, die Prüfung läuft weiter.
+- **Ergebnis in Klartext:** Was ist das, warum ist es wichtig, was solltest du tun. Rohdaten und Befehle bleiben im Terminal rechts.
+
+![Startseite während einer Prüfung](../bilder/kontrollzentrum/09-startseite-einfach-laeuft.png)
+![Ergebnis in einfacher Sprache](../bilder/kontrollzentrum/10-ergebnis-klartext.png)
+
+**Echter Lauf (ehrlich):** Die Schnell-Prüfung lief gegen die eigene Übungsmaschine. Alle drei Schritte liefen durch.
+Gefunden wurden drei Software-Angaben (Apache, HTTP-Server, WordPress), keine Lücke mit hoher Dringlichkeit.
+Das Werkzeug für bekannte Lücken fand auf dieser Maschine nichts. Das ist ein Messergebnis, kein Fehler.
+
 ## Was bewusst nicht drin ist
 
 - Keine Zusammenstellung von Angriffsbefehlen für fremde Ziele.

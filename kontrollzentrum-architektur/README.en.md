@@ -67,6 +67,22 @@ If no authorization exists, the report says so explicitly.
 - **Test against a server of my own on the internet:** The firewall only lets SSH through. The scan finds exactly that port and suggests no web step. A password test against SSH was deliberately left out, because the server locks out after failed attempts.
 - **Still open:** playbooks (fixed sequences with branches), a view to compare two states, and a measurement against a real practice machine.
 
+## Simple operation (second revision)
+
+- **Start page:** "What do you want to check?" with five categories (website, network, WLAN, files & passwords, reports).
+  Below are three recommended checks with an explanation and a rough duration. Technical areas sit behind "Advanced".
+- **Preview before every check:** target, permitted scope, steps (with a note when a tool is missing), duration and possible effects.
+  Start stays locked until the authorization is confirmed. The scope is checked again before **every** step.
+- **Run:** progress ("step 2 of 3"), a clock and a stop button. A missing tool is skipped and the check continues.
+- **Plain-language results:** what it is, why it matters, what to do. Raw data and commands stay in the terminal on the right.
+
+![Start page during a check](../bilder/kontrollzentrum/09-startseite-einfach-laeuft.png)
+![Plain-language result](../bilder/kontrollzentrum/10-ergebnis-klartext.png)
+
+**Real run (honest):** The quick check ran against my own practice machine; all three steps completed.
+The findings were three software notes (Apache, HTTP server, WordPress) and no high-urgency vulnerability.
+The known-vulnerability scanner found nothing on this machine. That is a measurement result, not a bug.
+
 ## Demo sequence (one example run with sample data)
 
 | Step | Image |
