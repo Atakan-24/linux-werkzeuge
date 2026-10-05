@@ -1,0 +1,17 @@
+name: Pruefen
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell-Skripte auf Fehler prüfen
+        run: shellcheck -S error desktop-setup/bin/design-apply desktop-setup/bin/kuerzel
+      - name: Python-Dateien auf Syntaxfehler prüfen
+        run: |
+          python3 -m py_compile desktop-setup/bin/terminal-studio desktop-setup/bin/mac-screenshot \
+            energie-sperre/claude-power energie-sperre/redcode-lock desktop-setup/mods/*.py

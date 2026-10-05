@@ -3,7 +3,7 @@
 Ein lokales Programm mit grafischer Oberfläche (Python, Tkinter), das Sicherheitsprüfungen
 für Einsteiger strukturiert: vom Ziel über die Freigabe bis zum Bericht.
 
-**Dieser Ordner enthält nur die Beschreibung, keinen Code der Werkzeug-Aufrufe.**
+**Dieser Ordner enthält nur die Beschreibung, keinen Code der Werkzeug-Aufrufe.** English version: [README.en.md](README.en.md)
 
 ## Die Idee
 
@@ -49,12 +49,27 @@ Fehlt die Freigabe, steht das im Bericht ausdrücklich.
 
 ![Werkzeugkiste](../bilder/kontrollzentrum/05-werkzeugkiste.png)
 
+## Bildfolge (ein Beispiellauf mit Beispieldaten)
+
+| Schritt | Bild |
+|---|---|
+| 1. Startseite | ![](../bilder/demo/1-startseite.png) |
+| 2. Weg mit Ziel und Freigabe | ![](../bilder/demo/2-weg-geraet.png) |
+| 3. Ergebnis des Schritts | ![](../bilder/demo/3-ergebnis.png) |
+| 4. Ergebnis in einfachen Worten | ![](../bilder/demo/4-was-heisst-das.png) |
+
 ## Tests
 
 - **Ablauf-Tests:** Die Oberfläche wird auf einem virtuellen Bildschirm (Xvfb) gestartet. Tests klicken Wege an, prüfen die Freigabe-Sperre und den Fortschritt, und vergleichen die Ergebnisse.
 - **Datenschutz der Tests:** Jeder Test legt seine Dateien in einen eigenen Ordner. Die echten Daten werden nie verändert.
 - **Logik-Tests:** Die Empfehlung des Assistenten und die Übersetzung der Ausgabe sind reine Funktionen und haben eigene Prüfungen.
 - **Fehler, die die Tests fanden:** Oberflächenzugriffe aus Hintergrund-Threads (führten zu Abstürzen), doppelt belegte Zeilen in Dialogen, und ein Testlauf, der versehentlich echte Dateien veränderte. Die Ursachen sind behoben, und die Tests isolieren seitdem alles.
+
+## Aufbau des Codes
+
+Die Oberfläche ist in Module pro Ansicht aufgeteilt (Startseite und Wege, Ziele, Schritte, Werkzeugkiste, WLAN, Hilfe, Assistent).
+Gemeinsame Grundlagen stehen in einer eigenen Datei. Nicht erreichbarer Code (eine alte Kategorien-Ansicht) wurde entfernt.
+Jedes Modul wird mit pyflakes geprüft.
 
 ## Was bewusst nicht drin ist
 

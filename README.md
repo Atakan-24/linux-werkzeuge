@@ -9,9 +9,14 @@ Alles in Bash und Python, mit Tests und Dokumentation. Jeder Teil ist für sich 
 |---|---|---|
 | [`desktop-setup/`](desktop-setup/) | Desktop anpassen: Farben, Tastenkürzel, Screenshots, Terminal-Oberfläche | GTK, XFCE-Einstellungen (xfconf), Python mit GObject, Konfigurations-Backups mit Rückweg |
 | [`energie-sperre/`](energie-sperre/) | Automatisch in Energiesparmodus, sicheres Sperren, Deckel-Verhalten | systemd, logind, Energieverwaltung, Shell-Hooks |
-| [`kontrollzentrum-architektur/`](kontrollzentrum-architektur/) | Beschreibung eines Werkzeugs für Sicherheitsprüfungen, mit Bildern | Python/Tkinter, Threads und Warteschlangen, Tests mit virtuellem Bildschirm, Freigabe-Logik |
+| [`kontrollzentrum-architektur/`](kontrollzentrum-architektur/) | Beschreibung eines Werkzeugs für Sicherheitsprüfungen, mit Bildern ([English](kontrollzentrum-architektur/README.en.md)) | Python/Tkinter, Threads und Warteschlangen, Tests mit virtuellem Bildschirm, Freigabe-Logik |
 | [`dienst-absicherung/`](dienst-absicherung/) | Wie ein lokaler Dienst gegen Befehlseinschleusung abgesichert wurde | Token-Anmeldung, Eingabeprüfung, Shell-Befehle und ihre Gefahren, Tests mit Angriffsversuchen |
 | [`bilder/`](bilder/) | Screenshots der Oberflächen | |
+
+## Prüfung
+
+Bei jeder Änderung prüft GitHub Actions die Skripte: `shellcheck` für die Bash-Dateien, Syntaxprüfung für die Python-Dateien
+(Datei [`.github/workflows/pruefen.yml`](.github/workflows/pruefen.yml)).
 
 ## Hinweis
 
