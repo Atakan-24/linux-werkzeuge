@@ -14,4 +14,6 @@ jobs:
       - name: Python-Dateien auf Syntaxfehler prüfen
         run: |
           python3 -m py_compile desktop-setup/bin/terminal-studio desktop-setup/bin/mac-screenshot \
-            energie-sperre/claude-power energie-sperre/redcode-lock desktop-setup/mods/*.py
+            energie-sperre/claude-power energie-sperre/redcode-lock desktop-setup/mods/*.py kontrollzentrum/code/*.py
+      - name: Kontrollzentrum-Logik testen
+        run: python3 kontrollzentrum/tests/test_logik.py
