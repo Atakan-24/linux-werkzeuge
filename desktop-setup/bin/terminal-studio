@@ -1,0 +1,2345 @@
+#!/usr/bin/env python3
+"""Terminal-Studio: QTerminal fast komplett anpassen (Schrift, Farben, Hintergrund, Cursor, Verhalten).
+
+Die Einstellungen werden in /etc/terminal-studio.json gespeichert und von
+/usr/local/bin/qterminal-studio bei jedem Terminal-Start angewendet (für DEIN_BENUTZER und root).
+Ein offenes QTerminal schreibt beim Schließen seine alten Werte zurück – das ist egal,
+denn beim nächsten Start werden die Studio-Werte wieder gesetzt.
+"""
+import datetime, json, os, pwd, re, subprocess, sys, tempfile, time, uuid
+from urllib.parse import unquote
+sys.path.insert(0, "/usr/local/lib")
+from terminal_style_logo_scale import scale_logo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gtk, Gdk, GLib, Pango, PangoCairo
+
+CONF = "/etc/terminal-studio.json"
+SCHEMES = "/usr/share/qtermwidget6/color-schemes"
+REDBG = "/usr/share/backgrounds/redcode/redcode-desktop.png"
+REDBG_NOLOGO = "/usr/share/backgrounds/redcode/redcode-nologo.png"
+CODEX_PALETTE = {"blue": "#89b4fa", "mint": "#a6e3a1",
+                 "lilac": "#cba6f7", "amber": "#fab387"}
+CODEX_DEFAULTS = {"theme": "blue", "left_color": "blue", "bottom_color": "mint",
+                  "custom_colors": {"theme": "#89b4fa", "left_color": "#fab387",
+                                    "bottom_color": "#a6e3a1"},
+                  "model": True, "effort": True, "five": True, "week": True,
+                  "cyber": True, "chat_summary": True, "summary_lines": 12,
+                  "animation": "spinner", "limit_display": "genutzt",
+                  "codex_input": "#ffffff", "claude_input": "#ffffff",
+                  "codex_output": "#cba6f7", "claude_output": "#cba6f7",
+                  "locations": {"model": "links", "effort": "links", "five": "links",
+                                "week": "links", "cyber": "links"}}
+
+DEFAULTS = {
+    "fontFamily": "FiraCode", "fontSize": 15, "BoldIntense": True,
+    "colorScheme": "Kali-Dark", "TerminalTransparency": 5, "BackgroundImageDim": 0,
+    "LogoPreviewSize": 12,
+    "custom": {"bg": "#0a0000", "fg": "#f2d6d6", "accent": "#e61e28"},
+    "TerminalBackgroundImage": "", "BackgroundImageFolder": "", "TerminalBackgroundMode": 0,
+    "KeyboardCursorShape": 0, "KeyboardCursorBlink": False, "TerminalMargin": 5,
+    "ScrollbarPosition": 2, "HistoryLimited": False, "HistoryLimitedTo": 1000,
+    "AudibleBell": False, "MenuVisible": True, "HideTabBarWithOneTab": True,
+    "Borderless": False, "TabsPosition": 0, "ConfirmMultilinePaste": False,
+    "panel2Locked": True, "panel2Struts": True, "panel2Mode": 0, "panel2Size": 62,
+    "claudeLimitsVisible": False, "claudeLimitsLocked": True,
+    "codex_ui": CODEX_DEFAULTS,
+    "studioShortcuts": {"copy": "Alt+C", "paste": "Alt+V", "save": "Ctrl+S",
+                        "test": "Ctrl+Shift+S", "close": "^,1", "preview": "F9"},
+}
+STUDIO_HOTKEY_LABELS = {"copy": "Kopieren", "paste": "Einfügen", "save": "Speichern",
+                        "test": "Speichern + Test-Terminal", "close": "Studio schließen",
+                        "preview": "Große Banner-Vorschau"}
+SEQUENCE_WINDOW = 1.2      # Sekunden zwischen den Tasten einer Folge wie "Escape,1"
+KEY_HINTS = {
+    "Alt+C": "Kopiert im normalen Terminal ohne die Markierung aufzuheben; in tmux bleibt die Auswahl erhalten.",
+    "Alt+V": "Fügt in QTerminal direkt und in anderen Terminals per Umschalt+Einfg ein.",
+    "Alt+A": "Im Codex-Terminal: Eingabezeile zum Kopieren, Löschen oder Ersetzen; im Scrollmodus: Verlauf bis Cursor.",
+    "Alt+Q": "In Terminals gehört Alt+Q tmux (Scroll-Modus ein/aus).",
+    "Tab+Space": "Öffnet die Pfeil-Auswahl (Browser, Dock, Leiste, Fenster).",
+    "Win+PageUp/PageDown": "Wechselt zwischen den vier Arbeitsflächen.",
+    "Up": "Systemweit: vorherige Arbeitsfläche.",
+    "Down": "Systemweit: nächste Arbeitsfläche.",
+    "Ctrl+Alt+Left": "Systemweit: Arbeitsfläche links.",
+    "Ctrl+Alt+Right": "Systemweit: Arbeitsfläche rechts.",
+    "Alt+Shift+Left": "Systemweit: Arbeitsfläche links.",
+    "Alt+Shift+Right": "Systemweit: Arbeitsfläche rechts.",
+    "Alt+F4": "Systemweit: Fenster schließen.",
+}
+
+
+def parse_binding(text):
+    """'Escape,1' -> ['Escape', '1'];  'Alt+C' -> ['Alt+C'];  '' -> []"""
+    return [part.strip() for part in str(text or "").split(",") if part.strip()]
+
+
+class SequenceMatcher:
+    """Erkennt Tastenfolgen wie 'Escape,1'. Einzeltasten meldet er als 'kein'."""
+
+    def __init__(self, clock=None, window=SEQUENCE_WINDOW):
+        self.clock = clock or time.monotonic
+        self.window = window
+        self.pending = None            # (aktion, index des naechsten Schritts, zeitpunkt)
+
+    def feed(self, key, bindings):
+        """-> ('treffer', aktion) | ('wartet', aktion) | ('kein', None)"""
+        now = self.clock()
+        if self.pending:
+            aktion, index, since = self.pending
+            self.pending = None
+            steps = parse_binding(bindings.get(aktion))
+            if now - since <= self.window and index < len(steps) and key == steps[index]:
+                if index + 1 == len(steps):
+                    return ("treffer", aktion)
+                self.pending = (aktion, index + 1, now)
+                return ("wartet", aktion)
+        for aktion, text in bindings.items():
+            steps = parse_binding(text)
+            if len(steps) > 1 and key == steps[0]:
+                self.pending = (aktion, 1, now)
+                return ("wartet", aktion)
+        return ("kein", None)
+
+
+PRESETS = {
+    "Rot-Code": {"colorScheme": "Red-Code", "TerminalTransparency": 8, "fontFamily": "FiraCode",
+                 "TerminalBackgroundImage": "", "KeyboardCursorShape": 0, "KeyboardCursorBlink": True},
+    "Rot-Code + Bild": {"colorScheme": "Red-Code", "TerminalTransparency": 0,
+                        "TerminalBackgroundImage": REDBG_NOLOGO, "TerminalBackgroundMode": 2},
+    "Rot-Code + Logo": {"colorScheme": "Red-Code", "TerminalTransparency": 0,
+                        "TerminalBackgroundImage": REDBG, "TerminalBackgroundMode": 2},
+    "Kali Standard": {"colorScheme": "Kali-Dark", "TerminalTransparency": 5, "TerminalBackgroundImage": "",
+                      "KeyboardCursorShape": 0, "KeyboardCursorBlink": False},
+    "Hacker Grün": {"colorScheme": "GreenOnBlack", "TerminalTransparency": 10, "TerminalBackgroundImage": ""},
+}
+TEXT_COLORS = (
+    ("Weiß", "#ffffff"), ("Warmweiß", "#f2e8df"), ("Silber", "#cbd5e1"),
+    ("Grau", "#94a3b8"), ("Schwarz", "#000000"), ("Rot", "#ff5c5c"),
+    ("Dunkelrot", "#b91c1c"), ("Koralle", "#ff9b8e"), ("Orange", "#ff9f43"),
+    ("Gelb", "#ffe66d"), ("Gold", "#ffd479"), ("Limette", "#b8f36b"),
+    ("Grün", "#65e572"), ("Dunkelgrün", "#15803d"), ("Mint", "#8ef0c1"),
+    ("Türkis", "#53e2d1"), ("Cyan", "#61e5ff"), ("Eisblau", "#91d8ff"),
+    ("Blau", "#6fa8ff"), ("Dunkelblau", "#2563eb"), ("Lila", "#ae8cff"),
+    ("Lavendel", "#c8b6ff"), ("Magenta", "#ee71dc"), ("Rosa", "#f5a9d6"),
+)
+TEXT_STYLES = {
+    "Klar & dunkel": ("#080a0e", "#f7f7f2", "#91d8ff", "#6fa8ff"),
+    "Neon": ("#050c0a", "#a5ffc8", "#61f5ff", "#39e58a"),
+    "Nordlicht": ("#111b29", "#e8f3ff", "#9ad5ff", "#7eaaff"),
+    "Bernstein": ("#17100a", "#ffe0aa", "#ffd479", "#ff9f43"),
+    "Pastell": ("#1b1323", "#ffe9f5", "#c8b6ff", "#f5a9d6"),
+    "Rot & Weiß": ("#13090b", "#fff1ed", "#ffb9ae", "#ff6d65"),
+}
+ANSI_NAMES = ("Schwarz", "Rot", "Grün", "Gelb", "Blau / Links", "Magenta", "Cyan", "Weiß")
+
+def default_ansi(custom):
+    bg, fg, ac = (hex2rgb(custom[k]) for k in ("bg", "fg", "accent"))
+    def mix(a, b, t):
+        return tuple(a[i] * (1 - t) + b[i] * t for i in range(3))
+    base = [mix(bg, (0, 0, 0), .3), ac, mix(ac, (1, .86, 0), .5),
+            mix(ac, (1, 1, 0), .7), mix(ac, (.24, .35, 1), .6),
+            mix(ac, (.78, 0, 1), .5), mix(ac, (0, .86, 1), .5), fg]
+    bright = [mix(color, (1, 1, 1), .35) for color in base]
+    return ["#%02x%02x%02x" % tuple(round(v * 255) for v in color) for color in base + bright]
+
+
+def load():
+    c = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONF) as f:
+            c.update(json.load(f))
+    except Exception:
+        pass
+    custom = c["custom"]
+    custom.setdefault("ansi", default_ansi(custom))
+    custom.setdefault("fg_bright", "#ffffff")
+    c["studioShortcuts"] = {**DEFAULTS["studioShortcuts"], **c.get("studioShortcuts", {})}
+    if c["studioShortcuts"].get("close") in ("Escape", "Escape,1") and not c.get("migratedCirc"):
+        c["studioShortcuts"]["close"] = "^,1"           # ^ statt Esc; ^ allein schliesst das Studio nicht
+    c["migratedCirc"] = True
+    c["migratedEsc1"] = True
+    ini = os.path.expanduser("~/.config/qterminal.org/qterminal.ini")
+    shortcuts = {}
+    try:
+        section = False
+        for line in open(ini):
+            line = line.strip()
+            if line.startswith("["):
+                section = line == "[Shortcuts]"
+            elif section and "=" in line:
+                key, value = line.split("=", 1)
+                shortcuts[key] = value
+    except OSError:
+        pass
+    saved_shortcuts = c.get("terminalShortcuts", {})
+    c["terminalShortcuts"] = {**shortcuts, **saved_shortcuts}
+    for key, default in (("Copy%20Selection", "Ctrl+Shift+C"), ("Paste%20Clipboard", "Alt+V")):
+        if key not in saved_shortcuts:
+            c["terminalShortcuts"][key] = default
+    return c
+
+
+def read_scheme(name):
+    """Hintergrund/Vordergrund/Rot aus einer .colorscheme-Datei lesen (für die Vorschau)."""
+    cols, sec = {}, None
+    try:
+        with open(os.path.join(SCHEMES, name + ".colorscheme")) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    sec = line[1:-1]
+                elif line.startswith("Color=") and sec:
+                    cols[sec] = tuple(int(x) / 255 for x in line[6:].split(",")[:3])
+    except Exception:
+        pass
+    return cols.get("Background", (0.1, 0.1, 0.1)), cols.get("Foreground", (1, 1, 1)), cols.get("Color1", (0.9, 0.1, 0.1)), cols.get("Color2", (0.4, 0.8, 0.6)), cols.get("Color4", (0.3, 0.5, 1))
+
+
+def hex2rgb(h):
+    h = h.lstrip("#"); return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def mono_fonts():
+    out = subprocess.run(["fc-list", ":spacing=mono", "family"], capture_output=True, text=True).stdout
+    fams = sorted({l.split(",")[0].strip() for l in out.splitlines() if l.strip() and "Emoji" not in l and "MathJax" not in l and "SignWriting" not in l})
+    if "FiraCode" not in fams:
+        fams.insert(0, "FiraCode")
+    return fams
+
+
+BANNER_DIR = os.path.expanduser("~/.config/terminal-style")
+BANNER_CONF = os.path.join(BANNER_DIR, "config")
+BANNER_DEFAULTS = {"BANNER_AN": "ja", "LOGO_ART": "arch", "LOGO_INVERT": "nein",
+                   "BANNER_TEXT": "KALI", "BANNER_SCHRIFT": "slant",
+                   "BANNER_SPACING": "1", "REGENBOGEN": "ja", "INFO_ZEILE": "ja",
+                   "TMUX_AUTOSTART": "nein", "TMUX_FARBE": "#89b4fa",
+                   "INPUT_COLOR": "#7dd3fc", "LOGO_COLOR": "#f2d6d6",
+                   "BANNER_COLOR": "#f2d6d6", "LOGO_SCALE": "100", "HIDDEN_LOGOS": "",
+                   "LOGO_FARBEN": "", "LOGO_FENSTER_AUFWEITEN": "nein"}
+
+LOGO_ARTS = {
+    "aus": ("Aus", ""),
+    "arch": ("Arch Detail", "logos/arch_detail.txt"),
+    "anime": ("Anime Detail", "logos/anime_detail.txt"),
+    "anime_arch": ("Anime + Arch Detail", "logos/anime_arch_detail.txt"),
+    "anime_block": ("Anime Block", "logos/anime_block.txt"),
+    "custom": ("Eigenes eingefuegt", "logos/custom.txt"),
+}
+CUSTOM_LOGO = os.path.join(BANNER_DIR, "logos/custom.txt")
+OWN_LOGOS_FILE = os.path.join(BANNER_DIR, "own-logos.json")
+
+
+def load_own_logos():
+    try:
+        with open(OWN_LOGOS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and
+                    re.fullmatch(r"[0-9a-f]{32}", str(item.get("id", ""))) and
+                    isinstance(item.get("name"), str) and isinstance(item.get("art"), str)]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def logo_art(key):
+    if key.startswith("user:"):
+        logo_id = key[5:]
+        if not re.fullmatch(r"[0-9a-f]{32}", logo_id):
+            return ""
+        for directory in (BANNER_DIR, "/root/.config/terminal-style"):
+            try:
+                with open(os.path.join(directory, "logos", "user_" + logo_id + ".txt")) as f:
+                    return f.read().rstrip("\n")
+            except OSError:
+                continue
+        return ""
+    value = LOGO_ARTS.get(key, LOGO_ARTS["arch"])[1]
+    if not value:
+        return ""
+    path = os.path.join(BANNER_DIR, value)
+    shared_path = os.path.join("/root/.config/terminal-style", value)
+    try:
+        with open(path) as f:
+            return f.read().rstrip("\n")
+    except OSError:
+        try:
+            with open(shared_path) as f:
+                return f.read().rstrip("\n")
+        except OSError:
+            return value
+
+
+def load_custom_logo():
+    try:
+        with open(CUSTOM_LOGO) as f:
+            return f.read().rstrip("\n")
+    except OSError:
+        return ""
+
+
+def save_custom_logo(text):
+    os.makedirs(os.path.dirname(CUSTOM_LOGO), exist_ok=True)
+    with open(CUSTOM_LOGO, "w") as f:
+        f.write(text.rstrip("\n") + "\n")
+
+
+def invert_logo_text(text):
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if 0x2800 <= code <= 0x28FF:
+            out.append(chr(0x2800 + (0xFF - (code - 0x2800))))
+        elif ch == "█":
+            out.append(" ")
+        elif ch == " ":
+            out.append("█")
+        elif ch == "#":
+            out.append(" ")
+        elif ch == ".":
+            out.append("█")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def load_banner():
+    """Liest ~/.config/terminal-style/config (Shell-Format KEY=\"wert\")."""
+    import shlex
+    b = dict(BANNER_DEFAULTS)
+    try:
+        for line in open(BANNER_CONF):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k in b:
+                    parts = shlex.split(v)
+                    b[k] = parts[0] if parts else ""
+    except FileNotFoundError:
+        pass
+    return b
+
+
+def save_banner(b):
+    import shlex
+    os.makedirs(BANNER_DIR, exist_ok=True)
+    with open(BANNER_CONF, "w") as f:
+        f.write("# Terminal-Style Einstellungen (vom Terminal-Studio geschrieben)\n")
+        for k in BANNER_DEFAULTS:
+            f.write("%s=%s\n" % (k, shlex.quote(str(b[k]))))
+    hexc = b["TMUX_FARBE"]
+    with open(os.path.join(BANNER_DIR, "tmux-farbe.conf"), "w") as f:
+        f.write('set -g status-left "#[bg=%s,fg=#1e1e2e,bold] #S #[default] "\nset -g pane-active-border-style "fg=%s"\n' % (hexc, hexc))
+
+
+def figlet_fonts():
+    good = ("standard", "slant", "smslant", "small", "mini", "big", "block", "lean", "shadow", "smshadow")
+    return [("plain", "Klartext (ohne ASCII-Symbole)")] + [
+        (font, font) for font in good if os.path.exists("/usr/share/figlet/" + font + ".flf")]
+
+
+def squeeze_banner_spacing(text, spacing):
+    """Reduziert breite Leerraeume im Start-Banner, ohne Einrueckung komplett zu zerquetschen."""
+    try:
+        spacing = max(0, min(8, int(spacing)))
+    except ValueError:
+        spacing = 1
+    keep = spacing + 1
+    out = []
+    for line in text.splitlines():
+        prefix_len = len(line) - len(line.lstrip(" "))
+        prefix = line[:prefix_len]
+        body = line[prefix_len:]
+        while " " * (keep + 2) in body:
+            body = body.replace(" " * (keep + 2), " " * (keep + 1))
+        out.append(prefix + body)
+    return "\n".join(out)
+
+
+def render_banner_text(b, custom_text=None, own_logos=None):
+    if b.get("BANNER_AN") != "ja":
+        return ""
+    parts = []
+    if b.get("LOGO_ART") == "custom" and custom_text is not None:
+        art = custom_text.rstrip("\n")
+    elif b.get("LOGO_ART", "").startswith("user:") and own_logos is not None:
+        art = next((item["art"].rstrip("\n") for item in own_logos
+                    if "user:" + item["id"] == b["LOGO_ART"]), "")
+    else:
+        art = logo_art(b.get("LOGO_ART", "arch"))
+    if b.get("LOGO_INVERT") == "ja":
+        art = invert_logo_text(art)
+    art = scale_logo(art, b.get("LOGO_SCALE", "100"))
+    if art:
+        parts.append(art)
+    text = b.get("BANNER_TEXT", "KALI") or "KALI"
+    font = b.get("BANNER_SCHRIFT", "slant") or "slant"
+    if font == "plain":
+        fig = text
+    else:
+        try:
+            fig = subprocess.run(["figlet", "-w", "80", "-f", font, text], capture_output=True, text=True, timeout=2).stdout.rstrip("\n")
+        except Exception:
+            fig = text
+    fig = squeeze_banner_spacing(fig, b.get("BANNER_SPACING", "1"))
+    if fig:
+        parts.append(fig)
+    output = "\n\n".join(parts)
+    if b.get("INFO_ZEILE") == "ja":
+        user = pwd.getpwuid(os.geteuid()).pw_name
+        info = "  %s@%s  |  %s" % (
+            user, os.uname().nodename, datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))
+        output = output + "\n" + info if output else info
+    return output
+
+
+# ---------- Eigene Profile ----------
+PROFILES_FILE = os.path.join(BANNER_DIR, "studio-profiles.json")
+PROFILE_C_KEYS = ("fontFamily", "fontSize", "BoldIntense", "colorScheme", "TerminalTransparency",
+                  "TerminalBackgroundImage", "TerminalBackgroundMode", "BackgroundImageFolder",
+                  "BackgroundImageDim", "KeyboardCursorShape", "KeyboardCursorBlink", "TerminalMargin",
+                  "ScrollbarPosition", "HistoryLimited", "HistoryLimitedTo", "AudibleBell", "MenuVisible",
+                  "HideTabBarWithOneTab", "Borderless", "TabsPosition", "ConfirmMultilinePaste",
+                  "LogoPreviewSize", "custom")
+PROFILE_B_KEYS = ("BANNER_AN", "LOGO_ART", "LOGO_INVERT", "BANNER_TEXT", "BANNER_SCHRIFT", "BANNER_SPACING",
+                  "REGENBOGEN", "INFO_ZEILE", "TMUX_AUTOSTART", "TMUX_FARBE", "INPUT_COLOR", "LOGO_COLOR",
+                  "BANNER_COLOR", "LOGO_SCALE", "LOGO_FARBEN", "LOGO_FENSTER_AUFWEITEN")
+
+
+def load_profiles():
+    """{'own': {Name: {'c':{}, 'b':{}}}, 'hidden': [ausgeblendete Vorlagen]}"""
+    data = {"own": {}, "hidden": []}
+    try:
+        with open(PROFILES_FILE) as f:
+            raw = json.load(f)
+        if isinstance(raw.get("own"), dict):
+            data["own"] = {str(k)[:40]: v for k, v in raw["own"].items() if isinstance(v, dict)}
+        if isinstance(raw.get("hidden"), list):
+            data["hidden"] = [h for h in raw["hidden"] if isinstance(h, str)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return data
+
+
+def save_profiles(data):
+    os.makedirs(BANNER_DIR, exist_ok=True)
+    tmp = PROFILES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, PROFILES_FILE)
+
+
+def clean_profile_name(text):
+    name = " ".join(str(text or "").split())
+    return "".join(ch for ch in name if ch.isprintable())[:40].strip()
+
+
+class Studio(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Terminal-Studio")
+        try:
+            _mon = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
+            _geo = _mon.get_geometry()
+            self.set_default_size(min(1240, _geo.width - 40), min(720, _geo.height - 160))
+        except Exception:
+            self.set_default_size(1240, 720)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_icon_name("terminal-studio")
+        self.c = load()
+        self.codex_ui = {**json.loads(json.dumps(CODEX_DEFAULTS)), **self.c.get("codex_ui", {})}
+        self.codex_ui["custom_colors"] = {**CODEX_DEFAULTS["custom_colors"],
+                                          **self.codex_ui.get("custom_colors", {})}
+        self.codex_ui["locations"] = {**CODEX_DEFAULTS["locations"],
+                                      **self.codex_ui.get("locations", {})}
+        self.b = load_banner()
+        self.hidden_logos = set(filter(None, self.b.get("HIDDEN_LOGOS", "").split(",")))
+        self.own_logos = load_own_logos()
+        self.profiles = load_profiles()
+        self.building = True
+        self.recording_hotkey = None
+        self.last_text_focus = None
+        self.sequences = SequenceMatcher()
+        self.hint_source = None
+        self.hotkey_entries = {}
+        self.test_entry = None
+        self.test_last = None
+        self.hotkey_initial = dict(self.c["terminalShortcuts"])
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+          window { background: #120404; color: #f0d0d0; }
+          notebook header { background: #1c0606; }
+          notebook tab label { color: #ff7070; }
+          .title { font-size: 20px; font-weight: bold; color: #ff4040; }
+          .hint { color: #b08080; font-size: 11px; }
+          button.save { background: #a00010; color: white; font-weight: bold; }
+          .banner-preview text { background: #090b10; color: #ededed; }
+          window.close-pending { border: 5px solid #ff3030; }
+          entry.konflikt { border: 2px solid #ff3030; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        self.add(root)
+        t = Gtk.Label(label="Terminal-Studio", xalign=0); t.get_style_context().add_class("title")
+        root.pack_start(t, False, False, 0)
+
+        pres = Gtk.Box(spacing=6)
+        pres.pack_start(Gtk.Label(label="Profile:"), False, False, 0)
+        self.profile_flow = Gtk.FlowBox()
+        self.profile_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.profile_flow.set_homogeneous(False)
+        self.profile_flow.set_column_spacing(6)
+        self.profile_flow.set_row_spacing(4)
+        self.profile_flow.set_max_children_per_line(12)
+        self.preset_buttons = []
+        self.build_profile_buttons()
+        pres.pack_start(self.profile_flow, True, True, 0)
+        root.pack_start(pres, False, False, 0)
+        pres2 = Gtk.Box(spacing=6)
+        for text, handler in (("Aktuellen Stand als Profil speichern …", self.profile_speichern_dialog),
+                              ("Profile löschen …", self.profile_loeschen_dialog),
+                              ("Gelöschte Vorlagen zurückholen", self.profile_zurueckholen)):
+            kb = Gtk.Button(label=text)
+            kb.connect("clicked", handler)
+            pres2.pack_start(kb, False, False, 0)
+        root.pack_start(pres2, False, False, 0)
+
+        body = Gtk.Paned(); root.pack_start(body, True, True, 0)
+        nb = Gtk.Notebook(); self.notebook = nb; body.pack1(nb, True, False)
+        nb.set_scrollable(True)     # viele Reiter: Leiste scrollt, Fenster wird nicht breiter als der Bildschirm
+        self.preview = Gtk.DrawingArea(); self.preview.set_size_request(430, -1)
+        self.preview.connect("draw", self.draw_preview)
+        self.banner_view = Gtk.TextView()
+        self.fit_banner = True
+        self.banner_view.set_editable(False)
+        self.banner_view.set_cursor_visible(False)
+        self.banner_view.set_monospace(True)
+        self.banner_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.banner_view.set_left_margin(0)
+        self.banner_view.set_top_margin(0)
+        self.banner_view.override_font(Pango.FontDescription(
+            f"{self.c['fontFamily']} {self.c['LogoPreviewSize']}"))
+        self.banner_view.get_style_context().add_class("banner-preview")
+        self.banner_preview_buffer = self.banner_view.get_buffer()
+        self._preview_color_tags = {}
+        self.banner_preview_buffer.connect("changed", self.banner_preview_changed)
+        self._updating_banner_preview = False
+        self._editing_banner_preview = False
+        banner_scroll = Gtk.ScrolledWindow()
+        banner_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        banner_scroll.add(self.banner_view)
+        self.banner_scroll = banner_scroll
+        banner_scroll.connect("size-allocate", self.banner_preview_resized)
+        self.preview_stack = Gtk.Stack()
+        self.preview_stack.add_named(self.preview, "terminal")
+        self.preview_stack.add_named(banner_scroll, "banner")
+        self.codex_preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=20)
+        self.codex_preview.set_valign(Gtk.Align.CENTER)
+        self.codex_preview_labels = []
+        for _ in range(8):
+            label = Gtk.Label(xalign=0)
+            label.set_use_markup(True)
+            label.set_line_wrap(True)
+            self.codex_preview.pack_start(label, False, False, 0)
+            self.codex_preview_labels.append(label)
+        self.preview_stack.add_named(self.codex_preview, "codex")
+        self.preview_stack.set_visible_child_name("terminal")
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        right.set_size_request(530, -1)
+        preview_head = Gtk.Box(spacing=8)
+        self.preview_heading = Gtk.Label(label="Vorschau rechts – großes Bild: scrollen", xalign=0)
+        preview_head.pack_start(self.preview_heading, True, True, 0)
+        self.fit_button = Gtk.Button(label="Originalgröße")
+        self.fit_button.connect("clicked", self.toggle_fit_banner)
+        preview_head.pack_end(self.fit_button, False, False, 0)
+        full = Gtk.Button(label="Groß öffnen")
+        self.full_button = full
+        full.connect("clicked", self.open_large_banner_preview)
+        preview_head.pack_end(full, False, False, 0)
+        right.pack_start(preview_head, False, False, 0)
+        right.pack_start(self.preview_stack, True, True, 0)
+        self.preview_logo_tools = Gtk.Box(spacing=6)
+        self.preview_logo_tools.pack_start(Gtk.Label(label="Eigenes Logo:"), False, False, 0)
+        self.preview_logo_name = Gtk.Entry()
+        self.preview_logo_name.set_placeholder_text("Name für mein Logo")
+        self.preview_logo_tools.pack_start(self.preview_logo_name, True, True, 0)
+        preview_save = Gtk.Button(label="Als Option speichern")
+        preview_save.connect("clicked", self.add_own_logo)
+        self.preview_logo_save = preview_save
+        self.preview_logo_tools.pack_start(preview_save, False, False, 0)
+        right.pack_start(self.preview_logo_tools, False, False, 0)
+        self.preview_width_hint = Gtk.Label(xalign=0)
+        self.preview_width_hint.get_style_context().add_class("hint")
+        right.pack_start(self.preview_width_hint, False, False, 0)
+        body.pack2(right, True, False)
+
+        self.w = {}
+        self.font_scales = []
+        self.preview_override = None
+        self.banner_preview_override = None
+        nb.append_page(self.page_font(), Gtk.Label(label="Schrift"))
+        nb.append_page(self.page_colors(), Gtk.Label(label="Farben"))
+        nb.append_page(self.page_background(), Gtk.Label(label="Hintergrund"))
+        nb.append_page(self.page_cursor(), Gtk.Label(label="Cursor & Verhalten"))
+        nb.append_page(self.page_banner(), Gtk.Label(label="Banner & tmux"))
+        nb.append_page(self.page_design(), Gtk.Label(label="Design"))
+        nb.append_page(self.page_panel(), Gtk.Label(label="Leiste"))
+        zentral_ok = False
+        try:                                    # ein Reiter für alle Kürzel
+            sys.path.insert(0, "/usr/local/lib/terminal-studio-mods")
+            import kuerzel_zentral, kuerzel_seite as _ks
+            nb.append_page(kuerzel_zentral.baue_seite(self, self.page_hotkeys(), _ks.baue_seite(self)),
+                           Gtk.Label(label="Tastenkürzel"))
+            zentral_ok = True
+        except Exception as fehler:
+            print("Zentrale Kürzel-Seite nicht geladen:", fehler, file=sys.stderr)
+        if not zentral_ok:
+            nb.append_page(self.page_hotkeys(), Gtk.Label(label="Hotkeys"))
+        nb.append_page(self.page_codex(), Gtk.Label(label="Codex & Claude"))
+        try:                                    # Reiter "Tastenkürzel" (nur, wenn der zentrale Reiter fehlt)
+            sys.path.insert(0, "/usr/local/lib/terminal-studio-mods")
+            import kuerzel_seite
+            if not zentral_ok:
+                nb.append_page(kuerzel_seite.baue_seite(self), Gtk.Label(label="Tastenkürzel"))
+        except Exception as fehler:
+            print("Tastenkuerzel-Reiter nicht geladen:", fehler, file=sys.stderr)
+        try:                                    # Reiter "Ladebildschirm"
+            import boot_seite
+            def boot_art(key):
+                if key == "custom":
+                    return self.current_custom_logo_text()
+                if key.startswith("user:"):
+                    return next((i["art"] for i in self.own_logos if "user:" + i["id"] == key), "")
+                return logo_art(key)
+            nb.append_page(boot_seite.baue_seite(self, boot_art), Gtk.Label(label="Ladebildschirm"))
+            self.boot_tab_index = nb.get_n_pages() - 1
+        except Exception as fehler:
+            print("Ladebildschirm-Reiter nicht geladen:", fehler, file=sys.stderr)
+        try:                                    # Reiter "Umzug"
+            import umzug_seite
+            nb.append_page(umzug_seite.baue_seite(self), Gtk.Label(label="Umzug"))
+        except Exception as fehler:
+            print("Umzug-Reiter nicht geladen:", fehler, file=sys.stderr)
+        try:                                    # Reiter "Rice" (alles oder einzelne Ebenen zurücksetzen)
+            import rice_seite
+            nb.append_page(rice_seite.baue_seite(self), Gtk.Label(label="Rice"))
+        except Exception as fehler:
+            print("Rice-Reiter nicht geladen:", fehler, file=sys.stderr)
+        try:                                    # Reiter "Desktop-Bild" (Hintergrundbild wählen/zurücksetzen)
+            import hintergrund_seite
+            nb.append_page(hintergrund_seite.baue_seite(self), Gtk.Label(label="Desktop-Bild"))
+            self.extra_previews = dict(getattr(self, "extra_previews", {}))
+            self.extra_previews[nb.get_n_pages() - 1] = "wall"
+        except Exception as fehler:
+            print("Desktop-Bild-Reiter nicht geladen:", fehler, file=sys.stderr)
+        try:                                    # Reiter "Sperre" (Bildschirm-Sperre an/aus)
+            import sperre_seite
+            nb.append_page(sperre_seite.baue_seite(self), Gtk.Label(label="Sperre & Energie"))
+        except Exception as fehler:
+            print("Sperre-Reiter nicht geladen:", fehler, file=sys.stderr)
+        for i in range(nb.get_n_pages()):       # jeder Reiter scrollbar, damit das Fenster auf den Bildschirm passt
+            seite = nb.get_nth_page(i)
+            if isinstance(seite, Gtk.ScrolledWindow):
+                continue
+            kopf = nb.get_tab_label(seite)
+            nb.remove_page(i)
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            sw.set_min_content_height(200)
+            sw.add(seite)
+            nb.insert_page(sw, kopf, i)
+        nb.connect("switch-page", self.switch_preview_page)
+
+        bottom = Gtk.Box(spacing=8)
+        h = Gtk.Label(label="Gilt für jedes NEUE Terminal-Fenster. Im offenen Fenster: Strg + / Strg − für die Größe.", xalign=0)
+        h.get_style_context().add_class("hint")
+        bottom.pack_start(h, True, True, 0)
+        rb = Gtk.Button(label="Alles auf Standard zurück"); rb.connect("clicked", self.reset_all); bottom.pack_start(rb, False, False, 0)
+        tb = Gtk.Button(label="Speichern + Test-Terminal"); tb.connect("clicked", self.save, True); bottom.pack_start(tb, False, False, 0)
+        sb = Gtk.Button(label="Speichern"); sb.get_style_context().add_class("save"); sb.connect("clicked", self.save, False)
+        bottom.pack_start(sb, False, False, 0)
+        root.pack_start(bottom, False, False, 0)
+
+        self.building = False
+        self.connect("key-press-event", self.key_pressed)
+        self.connect("set-focus", self.remember_text_focus)
+        self.connect("delete-event", self.confirm_delete)
+        self.connect("destroy", Gtk.main_quit)
+        self.show_all()
+        self.preview_logo_tools.hide()
+        self.update_codex_preview()
+        self.preview_stack.set_visible_child_name("terminal")   # zusätzliche Vorschau-Seiten dürfen nicht vorne stehen
+        if '--hotkeys' in sys.argv:
+            self.notebook.set_current_page(7)
+        if '--kuerzel' in sys.argv:
+            self.notebook.set_current_page(7 if zentral_ok else 9)
+
+    # ---------- Helfer zum Bauen der Seiten ----------
+    def grid(self):
+        g = Gtk.Grid(column_spacing=12, row_spacing=10, margin=14); g.row = 0; return g
+
+    def mit_standard(self, widget):
+        """Schieberegler/Zahlfeld mit „Standard: N“ und Zurück-Knopf umgeben (Wert in widget._standard)."""
+        std = getattr(widget, "_standard", None)
+        if std is None or not isinstance(widget, (Gtk.Scale, Gtk.SpinButton)):
+            return widget
+        std = int(std)
+        box = Gtk.Box(spacing=8)
+        widget.set_hexpand(True)
+        box.pack_start(widget, True, True, 0)
+        lab = Gtk.Label(label="Standard: %d" % std)
+        lab.get_style_context().add_class("hint")
+        btn = Gtk.Button(label="↺ Standard")
+        btn.set_tooltip_text("Auf den Standardwert %d zurücksetzen" % std)
+        btn.connect("clicked", lambda _b: widget.set_value(std))
+
+        def sync(*_a):
+            btn.set_sensitive(int(round(widget.get_value())) != std)
+        widget.connect("value-changed", sync)
+        sync()
+        box.pack_start(lab, False, False, 0)
+        box.pack_start(btn, False, False, 0)
+        return box
+
+    def row(self, g, label, widget, hint=None):
+        widget = self.mit_standard(widget)
+        l = Gtk.Label(label=label, xalign=0); g.attach(l, 0, g.row, 1, 1)
+        widget.set_hexpand(True); g.attach(widget, 1, g.row, 1, 1); g.row += 1
+        if hint:
+            hl = Gtk.Label(label=hint, xalign=0); hl.get_style_context().add_class("hint"); g.attach(hl, 1, g.row, 1, 1); g.row += 1
+
+    def scale(self, key, lo, hi, step=1):
+        s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+        s.set_value(self.c[key]); s.set_digits(0); s.set_value_pos(Gtk.PositionType.RIGHT)
+        s.connect("value-changed", lambda w: self.set(key, int(w.get_value())))
+        if isinstance(DEFAULTS.get(key), int) and not isinstance(DEFAULTS.get(key), bool):
+            s._standard = DEFAULTS[key]
+        self.w[key] = s
+        if key == "fontSize":
+            self.font_scales.append(s)
+        return s
+
+    def switch(self, key):
+        s = Gtk.Switch(active=self.c[key], halign=Gtk.Align.START)
+        s.connect("notify::active", lambda w, _: self.set(key, w.get_active())); self.w[key] = s; return s
+
+    def combo(self, key, items):
+        """items: Liste (wert, text)"""
+        cb = Gtk.ComboBoxText()
+        for v, t in items:
+            cb.append(str(v), t)
+        cb.set_active_id(str(self.c[key]))
+        conv = type(items[0][0])
+        cb.connect("changed", lambda w: w.get_active_id() is not None and self.set(key, conv(w.get_active_id())))
+        self.w[key] = cb; return cb
+
+    # ---------- Seiten ----------
+    def page_font(self):
+        g = self.grid()
+        self.row(g, "Schriftart", self.combo("fontFamily", [(f, f) for f in mono_fonts()]))
+        self.row(g, "Schriftgröße", self.scale("fontSize", 6, 48), "Ziehen – die Vorschau rechts zeigt es sofort")
+        self.row(g, "Fett = hellere Farbe", self.switch("BoldIntense"))
+        return g
+
+    def page_colors(self):
+        g = self.grid()
+        schemes = sorted(n[:-12] for n in os.listdir(SCHEMES) if n.endswith(".colorscheme"))
+        if "Eigenes" not in schemes:
+            schemes.append("Eigenes")
+        self.row(g, "Farbschema", self.combo("colorScheme", [(s, "Eigenes (unten wählen)" if s == "Eigenes" else s) for s in schemes]))
+        self.row(g, "Durchsichtigkeit", self.scale("TerminalTransparency", 0, 100), "0 = deckend, 100 = vollständig transparent")
+        fully = Gtk.Button(label="Hintergrund ganz transparent machen")
+        fully.connect("clicked", self.make_fully_transparent)
+        self.row(g, "Schnellauswahl", fully, "Stellt auf 100 und entfernt ein gewähltes Hintergrundbild.")
+        self.custom_buttons = {}
+        for k, t in (("bg", "Eigenes: Hintergrund"), ("fg", "Eigenes: Ausgabe"),
+                     ("fg_bright", "Eigenes: helle Schrift"), ("accent", "Eigenes: Akzent")):
+            b = Gtk.ColorButton(rgba=self.rgba(self.c["custom"][k]))
+            self.custom_buttons[k] = b
+            if k == "fg":
+                self.output_color_button = b
+            b.connect("color-set", self.custom_color, k); self.row(g, t, b)
+        input_btn = Gtk.ColorButton(rgba=self.rgba(self.b["INPUT_COLOR"]))
+        self.input_color_button = input_btn
+        input_btn.connect("color-set", self.input_color_changed)
+        self.row(g, "Dein Text (Zsh-Eingabe)", input_btn,
+                 "Freie Farbwahl für Text, den du in der Zsh-Shell tippst")
+        self.row(g, "Antworten / Ausgabe: Farbvorlagen", self.color_palette("output"),
+                 "Allgemeine Terminal-Ausgabe; Programme können eigene Farben verwenden")
+        self.row(g, "Dein Text: Farbvorlagen", self.color_palette("input"),
+                 "Weitere Farben über den Farbwähler oben, auch per Hex-Code")
+        self.row(g, "Farb-Stile", self.color_styles(),
+                 "Ändert Hintergrund, Ausgabe, Eingabe und Akzent gemeinsam")
+        heading = Gtk.Label(label="Terminal-Ausgabe: ANSI-Farben einzeln", xalign=0)
+        heading.get_style_context().add_class("title")
+        g.attach(heading, 0, g.row, 2, 1); g.row += 1
+        self.ansi_buttons = []
+        for i in range(16):
+            button = Gtk.ColorButton(rgba=self.rgba(self.c["custom"]["ansi"][i]))
+            button.connect("color-set", self.ansi_color_changed, i)
+            self.ansi_buttons.append(button)
+            label = ("Hell: " if i >= 8 else "") + ANSI_NAMES[i % 8]
+            self.row(g, label, button)
+        h = Gtk.Label(label="Eigene Farben wirken, wenn oben „Eigenes“ gewählt ist.", xalign=0)
+        h.get_style_context().add_class("hint"); g.attach(h, 1, g.row, 1, 1)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(g)
+        return scroll
+
+    def page_background(self):
+        g = self.grid()
+        cb = Gtk.ComboBoxText()
+        cb.append("", "Kein Bild"); cb.append(REDBG_NOLOGO, "Roter Code (ohne Logo)"); cb.append(REDBG, "Roter Code mit Kali-Logo")
+        self.add_folder_images(cb, self.c.get("BackgroundImageFolder", ""))
+        cb.append("__logo__", "Text-Logo in der Mitte …")
+        cb.append("__file__", "Eigenes Bild wählen …")
+        cb.append("__folder__", "Eigenen Bilderordner wählen …")
+        cur = self.c["TerminalBackgroundImage"]
+        if cur not in ("", REDBG, REDBG_NOLOGO):
+            cb.append(cur, os.path.basename(cur))
+        cb.set_active_id(cur)
+        cb.connect("changed", self.bg_changed); self.w["bgimg"] = cb
+        self.row(g, "Hintergrundbild", cb, "Tipp: mit Bild die Durchsichtigkeit auf 0 stellen")
+        self.row(g, "Bild abdunkeln", self.scale("BackgroundImageDim", 0, 100),
+                 "0 = Originalbild, 100 = Bild ausgeblendet; macht Schrift besser lesbar")
+        self.row(g, "Bild-Anpassung", self.combo("TerminalBackgroundMode",
+                 [(0, "Normal"), (1, "Strecken"), (2, "Zoomen (füllt alles)"), (3, "Einpassen"), (4, "Mittig")]))
+        self.row(g, "Rand innen (Pixel)", self.scale("TerminalMargin", 0, 40))
+        self.row(g, "Rahmenlos (ohne Titelleiste)", self.switch("Borderless"))
+        self.row(g, "Menüleiste anzeigen", self.switch("MenuVisible"), "Wieder einblenden: Strg+Umschalt+M")
+        return g
+
+    def add_folder_images(self, cb, folder):
+        if not folder or not os.path.isdir(folder):
+            return []
+        images = []
+        try:
+            for entry in sorted(os.scandir(folder), key=lambda item: item.name.casefold()):
+                if entry.is_file() and entry.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")):
+                    images.append(entry.path)
+        except OSError:
+            return []
+        for path in images[:200]:
+            cb.append(path, "Ordner: " + os.path.basename(path))
+        return images[:200]
+
+    def page_cursor(self):
+        g = self.grid()
+        self.row(g, "Cursor-Form", self.combo("KeyboardCursorShape", [(0, "Block █"), (1, "Unterstrich _"), (2, "Strich |")]))
+        self.row(g, "Cursor blinkt", self.switch("KeyboardCursorBlink"))
+        self.row(g, "Scrollleiste", self.combo("ScrollbarPosition", [(0, "Keine"), (1, "Links"), (2, "Rechts")]))
+        self.row(g, "Tab-Leiste", self.combo("TabsPosition", [(0, "Oben"), (1, "Unten"), (2, "Links"), (3, "Rechts")]))
+        self.row(g, "Tab-Leiste bei 1 Tab verstecken", self.switch("HideTabBarWithOneTab"))
+        self.row(g, "Verlauf begrenzen", self.switch("HistoryLimited"))
+        self.row(g, "Verlauf: Zeilen", self.scale("HistoryLimitedTo", 500, 100000, 500))
+        self.row(g, "Warnton (Piepen)", self.switch("AudibleBell"))
+        self.row(g, "Nachfragen beim Einfügen mehrerer Zeilen", self.switch("ConfirmMultilinePaste"))
+        return g
+
+    def page_banner(self):
+        g = self.grid()
+        self.custom_logo_buffer = None
+        def sw(key):
+            w = Gtk.Switch(active=self.b[key] == "ja", halign=Gtk.Align.START)
+            w.connect("notify::active", lambda x, _: self.set_banner(key, "ja" if x.get_active() else "nein")); return w
+        e = Gtk.Entry(text=self.b["BANNER_TEXT"])
+        e.connect("changed", lambda x: self.set_banner("BANNER_TEXT", x.get_text()))
+        logo = self.hover_choice("LOGO_ART", self.logo_choices_list())
+        self.logo_choices = logo
+        logo_size = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 25, 150, 5)
+        logo_size.set_digits(0); logo_size.set_value_pos(Gtk.PositionType.RIGHT)
+        logo_size._standard = int(BANNER_DEFAULTS.get("LOGO_SCALE", "100"))
+        logo_size.set_value(int(self.b.get("LOGO_SCALE", "100")))
+        logo_size.connect("value-changed", lambda w: self.set_banner("LOGO_SCALE", str(int(w.get_value()))))
+        cb = self.hover_choice("BANNER_SCHRIFT", figlet_fonts())
+        spacing = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 8, 1)
+        spacing.set_digits(0); spacing.set_value_pos(Gtk.PositionType.RIGHT)
+        spacing._standard = int(BANNER_DEFAULTS.get("BANNER_SPACING", "1"))
+        try:
+            spacing.set_value(int(self.b["BANNER_SPACING"]))
+        except ValueError:
+            spacing.set_value(1)
+        spacing.connect("value-changed", lambda x: self.set_banner("BANNER_SPACING", str(int(x.get_value()))))
+        col = Gtk.ColorButton(); col.set_rgba(self.rgba(self.b["TMUX_FARBE"]))
+        def picked(btn):
+            r = btn.get_rgba(); self.b["TMUX_FARBE"] = "#%02x%02x%02x" % (int(r.red * 255), int(r.green * 255), int(r.blue * 255))
+        col.connect("color-set", picked)
+        logo_col = Gtk.ColorButton(rgba=self.rgba(self.b["LOGO_COLOR"]))
+        logo_col.connect("color-set", self.banner_color_changed, "LOGO_COLOR")
+        banner_col = Gtk.ColorButton(rgba=self.rgba(self.b["BANNER_COLOR"]))
+        banner_col.connect("color-set", self.banner_color_changed, "BANNER_COLOR")
+        self.row(g, "Banner beim Start anzeigen", sw("BANNER_AN"))
+        self.row(g, "Logo am Anfang", logo)
+        self.logo_size_scale = logo_size
+        size_box = Gtk.Box(spacing=8)
+        logo_size.set_size_request(260, -1)
+        size_box.pack_start(logo_size, False, False, 0)
+        size_reset = Gtk.Button(label="Zurücksetzen (100 %)")
+        size_reset.connect("clicked", lambda _b: logo_size.set_value(100))
+        size_box.pack_start(size_reset, False, False, 0)
+        self.row(g, "Logo-Größe im Terminal (%)", size_box,
+                 "100 % = Originalgröße. Das Logo besteht aus Buchstaben und wird bei anderen Größen unscharf.")
+        zoom = self.scale("LogoPreviewSize", 5, 32)
+        zoom_box = Gtk.Box(spacing=8)
+        zoom.set_size_request(260, -1)
+        zoom_box.pack_start(zoom, False, False, 0)
+        zoom_reset = Gtk.Button(label="Standard (12)")
+        zoom_reset.connect("clicked", lambda _b: zoom.set_value(12))
+        zoom_box.pack_start(zoom_reset, False, False, 0)
+        self.row(g, "Vorschau-Zoom", zoom_box, "Ändert nur die Vorschau rechts")
+        hide = Gtk.Button(label="Ausgewähltes vorinstalliertes Logo entfernen")
+        hide.connect("clicked", self.hide_builtin_logo)
+        self.row(g, "Logo aus Auswahl entfernen", hide)
+        restore = Gtk.Button(label="Vorinstallierte Logos wiederherstellen")
+        restore.connect("clicked", self.restore_builtin_logos)
+        self.row(g, "Wiederherstellen", restore)
+        self.row(g, "Logo invertieren", sw("LOGO_INVERT"), "Macht aus hell/dunkel eine invertierte Version, besonders gut bei Braille/Block-Art.")
+        self.row(g, "Banner-Text", e)
+        self.row(g, "Banner-Schrift", cb)
+        self.row(g, "Logo-Farbe", logo_col, "Sofort rechts sichtbar; Regenbogen ausschalten für eine feste Farbe")
+        self.row(g, "Text-Farbe", banner_col)
+        self.row(g, "Abstand im Banner", spacing, "0 = eng, 8 = luftig. Damit kannst du den grossen Wortabstand kleiner machen.")
+        self.rainbow_switch = sw("REGENBOGEN")
+        self.row(g, "Regenbogen-Farben (lolcat)", self.rainbow_switch)
+        try:
+            sys.path.insert(0, "/usr/local/lib/terminal-studio-mods")
+            import logo_farben
+            logo_farben.baue_zeilen(self, g)
+        except Exception as fehler:
+            print("Logo-Farben-Modul:", fehler, file=sys.stderr)
+        self.row(g, "Info-Zeile (User/Datum)", sw("INFO_ZEILE"))
+        self.row(g, "tmux automatisch starten", sw("TMUX_AUTOSTART"))
+        self.row(g, "tmux-Farbe", col, "Banner-Einstellungen gelten für das Konto, unter dem das Studio läuft (~/.config/terminal-style).")
+        custom = Gtk.TextView()
+        custom.set_monospace(True)
+        custom.set_wrap_mode(Gtk.WrapMode.NONE)
+        custom.set_size_request(-1, 180)
+        self.custom_logo_buffer = custom.get_buffer()
+        self.custom_logo_buffer.set_text(load_custom_logo())
+        self.custom_logo_buffer.connect("changed", lambda _b: self.custom_logo_changed())
+        custom_frame = Gtk.Frame(label="Eigenes Logo einfügen")
+        custom_scroll = Gtk.ScrolledWindow()
+        custom_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        custom_scroll.add(custom)
+        custom_frame.add(custom_scroll)
+        g.attach(custom_frame, 0, g.row, 2, 1); g.row += 1
+        tools = Gtk.Box(spacing=6)
+        paste = Gtk.Button(label="Aus Zwischenablage einfügen")
+        paste.connect("clicked", self.paste_logo)
+        tools.pack_start(paste, False, False, 0)
+        self.logo_name_entry = Gtk.Entry()
+        self.logo_name_entry.set_placeholder_text("Name für mein Logo")
+        tools.pack_start(self.logo_name_entry, True, True, 0)
+        add = Gtk.Button(label="Als Option speichern")
+        add.connect("clicked", self.add_own_logo)
+        tools.pack_start(add, False, False, 0)
+        remove = Gtk.Button(label="Ausgewähltes eigenes Logo löschen")
+        remove.connect("clicked", self.remove_own_logo)
+        tools.pack_start(remove, False, False, 0)
+        manage = Gtk.Button(label="Eigene Logos verwalten …")
+        manage.connect("clicked", self.logos_verwalten_dialog)
+        tools.pack_start(manage, False, False, 0)
+        g.attach(tools, 0, g.row, 2, 1); g.row += 1
+        self.logo_status = Gtk.Label(label="Eigene Logos werden sofort für Benutzer und Root gespeichert.", xalign=0)
+        self.logo_status.get_style_context().add_class("hint")
+        g.attach(self.logo_status, 0, g.row, 2, 1); g.row += 1
+        self.update_banner_preview()
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(g)
+        return scroll
+
+    def page_panel(self):
+        g = self.grid()
+        self.row(g, "Leiste verschiebbar sperren", self.switch("panel2Locked"),
+                 "Aktivieren, damit die untere Leiste an ihrer Position bleibt.")
+        self.row(g, "Arbeitsfläche freihalten", self.switch("panel2Struts"),
+                 "Aktivieren, damit Fenster nicht unter die Leiste rutschen.")
+        self.row(g, "Automatisch ausblenden", self.combo("panel2Mode", [
+            (0, "Nie"), (1, "Intelligent"), (2, "Immer")]))
+        self.row(g, "Leistenhöhe", self.scale("panel2Size", 24, 100),
+                 "Ändert die Höhe der unteren Leiste.")
+        self.row(g, "Claude-Limits unten rechts anzeigen", self.switch("claudeLimitsVisible"),
+                 "Aus = Anzeige weg; bei Bedarf später wieder einschalten")
+        self.row(g, "Claude-Anzeige an Position sperren", self.switch("claudeLimitsLocked"),
+                 "Verhindert versehentliches Verschieben der kleinen rechten Leiste")
+        return g
+
+    def codex_hex(self, key):
+        choice = self.codex_ui.get(key, "blue")
+        return (self.codex_ui["custom_colors"].get(key, "#89b4fa") if choice == "custom"
+                else CODEX_PALETTE.get(choice, "#89b4fa"))
+
+    def codex_choice_changed(self, combo, key):
+        if self.building or combo.get_active_id() is None:
+            return
+        self.codex_ui[key] = combo.get_active_id()
+        self.update_codex_preview()
+
+    def codex_custom_color_changed(self, button, key):
+        if self.building:
+            return
+        color = button.get_rgba()
+        self.codex_ui["custom_colors"][key] = "#%02x%02x%02x" % (
+            round(color.red * 255), round(color.green * 255), round(color.blue * 255))
+        self.codex_color_combos[key].set_active_id("custom")
+        self.update_codex_preview()
+
+    def chat_input_color_changed(self, button, key):
+        if self.building:
+            return
+        color = button.get_rgba()
+        self.codex_ui[key] = "#%02x%02x%02x" % (round(color.red * 255), round(color.green * 255), round(color.blue * 255))
+        self.update_codex_preview()
+
+    def chat_input_reset(self, _button, key):
+        self.codex_ui[key] = ""
+        self.building = True
+        self.chat_input_buttons[key].set_rgba(self.rgba(self.c["custom"]["fg"]))
+        self.building = False
+        self.update_codex_preview()
+
+    def codex_setting_changed(self, value, key):
+        if self.building:
+            return
+        self.codex_ui[key] = value
+        self.update_codex_preview()
+
+    def codex_location_changed(self, combo, key):
+        if self.building or combo.get_active_id() is None:
+            return
+        self.codex_ui["locations"][key] = combo.get_active_id()
+        self.update_codex_preview()
+
+    def codex_terminal_color_changed(self, button, key):
+        if self.building:
+            return
+        color = button.get_rgba()
+        value = "#%02x%02x%02x" % (round(color.red * 255), round(color.green * 255), round(color.blue * 255))
+        if key == "input":
+            self.b["INPUT_COLOR"] = value
+            self.input_color_button.set_rgba(self.rgba(value))
+        elif key in ("link", "error", "success"):
+            index = {"link": 4, "error": 1, "success": 2}[key]
+            self.c["custom"]["ansi"][index] = value
+            self.ansi_buttons[index].set_rgba(self.rgba(value))
+        else:
+            self.c["custom"][key] = value
+            self.custom_buttons[key].set_rgba(self.rgba(value))
+        if key != "input":
+            self.c["colorScheme"] = "Eigenes"
+            self.w["colorScheme"].set_active_id("Eigenes")
+        self.preview.queue_draw()
+        self.update_codex_preview()
+
+    def page_codex(self):
+        g = self.grid()
+        self.codex_color_combos = {}
+        self.codex_color_buttons = {}
+        self.codex_switches = {}
+        self.codex_position_combos = {}
+        intro = Gtk.Label(label="Gemeinsame Einstellungen für Codex- und Claude-Leiste und Chatliste. Die Vorschau rechts zeigt Codex als Beispiel; Claude nutzt seine eigenen Limit-Daten. Speichern aktualisiert beide.", xalign=0)
+        intro.set_line_wrap(True)
+        g.attach(intro, 0, g.row, 2, 1); g.row += 1
+        self.codex_terminal_buttons = {}
+        self.chat_input_buttons = {}
+        for key, label in (("codex_input", "Codex: deine Eingabe"),
+                           ("codex_output", "Codex: Antworten"),
+                           ("claude_input", "Claude Code: deine Eingabe"),
+                           ("claude_output", "Claude Code: Antworten")):
+            group = Gtk.Box(spacing=8)
+            current = self.codex_ui.get(key) or self.c["custom"]["fg"]
+            button = Gtk.ColorButton(rgba=self.rgba(current))
+            button.connect("color-set", self.chat_input_color_changed, key)
+            reset = Gtk.Button(label="Standard")
+            reset.connect("clicked", self.chat_input_reset, key)
+            self.chat_input_buttons[key] = button
+            group.pack_start(button, False, False, 0); group.pack_start(reset, False, False, 0)
+            self.row(g, label, group,
+                     "Eigene Farbe für das Eingabefeld; Speichern wirkt in den Chatfenstern."
+                     if key.endswith("_input") else
+                     "Farbe für normalen Antworttext; Code und Hinweise behalten ihre Hervorhebungen.")
+        for key, label, value in (
+                ("bg", "Terminal-Hintergrund", self.c["custom"]["bg"]),
+                ("fg", "Antworten / Ausgabe", self.c["custom"]["fg"]),
+                ("input", "Deine Zsh-Eingabe", self.b["INPUT_COLOR"]),
+                ("link", "Links / Blau", self.c["custom"]["ansi"][4]),
+                ("error", "Fehler / Rot", self.c["custom"]["ansi"][1]),
+                ("success", "Erfolg / Grün", self.c["custom"]["ansi"][2])):
+            button = Gtk.ColorButton(rgba=self.rgba(value))
+            button.connect("color-set", self.codex_terminal_color_changed, key)
+            self.codex_terminal_buttons[key] = button
+            self.row(g, label, button)
+        for key, label in (("theme", "Kopfzeile oben links"),
+                           ("left_color", "Chatliste links"),
+                           ("bottom_color", "Status unten")):
+            group = Gtk.Box(spacing=8)
+            combo = Gtk.ComboBoxText()
+            for value, title in (("blue", "Blau"), ("mint", "Mint"),
+                                 ("lilac", "Lila"), ("amber", "Bernstein"),
+                                 ("custom", "Eigene Farbe")):
+                combo.append(value, title)
+            combo.set_active_id(self.codex_ui[key])
+            combo.connect("changed", self.codex_choice_changed, key)
+            self.codex_color_combos[key] = combo
+            group.pack_start(combo, True, True, 0)
+            button = Gtk.ColorButton(rgba=self.rgba(self.codex_ui["custom_colors"][key]))
+            button.connect("color-set", self.codex_custom_color_changed, key)
+            self.codex_color_buttons[key] = button
+            group.pack_start(button, False, False, 0)
+            self.row(g, label, group)
+        for key, label in (("model", "Modell anzeigen"), ("effort", "Nachdenken anzeigen"),
+                           ("five", "5-Stunden-Limit anzeigen"), ("week", "Wochenlimit anzeigen"),
+                           ("cyber", "Berechtigungsmodus anzeigen")):
+            group = Gtk.Box(spacing=8)
+            switch = Gtk.Switch(active=self.codex_ui[key], halign=Gtk.Align.START)
+            switch.connect("notify::active", lambda w, _prop, k=key: self.codex_setting_changed(w.get_active(), k))
+            self.codex_switches[key] = switch
+            group.pack_start(switch, False, False, 0)
+            position = Gtk.ComboBoxText()
+            position.append("links", "Links"); position.append("unten", "Unten")
+            position.set_active_id(self.codex_ui["locations"].get(key, "unten"))
+            position.connect("changed", self.codex_location_changed, key)
+            self.codex_position_combos[key] = position
+            group.pack_start(position, True, True, 0)
+            self.row(g, label, group)
+        self.codex_summary_switch = Gtk.Switch(active=self.codex_ui["chat_summary"], halign=Gtk.Align.START)
+        self.codex_summary_switch.connect("notify::active", lambda w, _prop: self.codex_setting_changed(w.get_active(), "chat_summary"))
+        self.row(g, "Chat-Zusammenfassung", self.codex_summary_switch)
+        self.codex_summary_spin = Gtk.SpinButton.new_with_range(1, 16, 1)
+        self.codex_summary_spin._standard = CODEX_DEFAULTS["summary_lines"]
+        self.codex_summary_spin.set_value(self.codex_ui["summary_lines"])
+        self.codex_summary_spin.connect("value-changed", lambda w: self.codex_setting_changed(w.get_value_as_int(), "summary_lines"))
+        self.row(g, "Zusammenfassungszeilen", self.codex_summary_spin)
+        self.codex_animation_combo = Gtk.ComboBoxText()
+        for value, label in (("spinner", "Kreis"), ("dots", "Punkte"),
+                             ("pulse", "Puls"), ("wave", "Welle"),
+                             ("arrows", "Pfeile"), ("bar-right", "Balken"),
+                             ("aus", "Aus")):
+            self.codex_animation_combo.append(value, label)
+        self.codex_animation_combo.set_active_id(self.codex_ui["animation"])
+        self.codex_animation_combo.connect("changed", lambda w: w.get_active_id() and self.codex_setting_changed(w.get_active_id(), "animation"))
+        self.row(g, "Arbeitsanimation", self.codex_animation_combo)
+        self.codex_limit_combo = Gtk.ComboBoxText()
+        self.codex_limit_combo.append("genutzt", "Genutzt")
+        self.codex_limit_combo.append("übrig", "Übrig")
+        self.codex_limit_combo.set_active_id(self.codex_ui["limit_display"])
+        self.codex_limit_combo.connect("changed", lambda w: w.get_active_id() and self.codex_setting_changed(w.get_active_id(), "limit_display"))
+        self.row(g, "Limits anzeigen als", self.codex_limit_combo)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(g)
+        return scroll
+
+    def update_codex_preview(self):
+        if not hasattr(self, "codex_preview_labels"):
+            return
+        top, left, bottom = (self.codex_hex(key) for key in ("theme", "left_color", "bottom_color"))
+        bg = self.c["custom"]["bg"]; fg = self.c["custom"]["fg"]
+        link = self.c["custom"]["ansi"][4]
+        loc = self.codex_ui["locations"]
+        for block, (tool, badge, key, chat_name) in enumerate((
+                ("Codex", "Codex Chat", "codex_input", "Mein Chat"),
+                ("Claude Code", "Claude Chat", "claude_input", "Mein Chat"))):
+            typed = self.codex_ui.get(key) or fg
+            answer = self.codex_ui.get(key.replace("_input", "_output")) or fg
+            base = block * 4
+            self.codex_preview_labels[base].set_markup(
+                f'<span size="large" weight="bold">{tool}-Vorschau</span>')
+            widgets = [(k, t) for k, t in (("model", "Modell " + tool), ("effort", "Denken hoch"),
+                                           ("five", "5h 42%"), ("week", "Woche 21%"), ("cyber", "Vollzugriff"))
+                       if self.codex_ui.get(k)]
+            side = [t for k, t in widgets if loc.get(k) == "links"]
+            foot = [t for k, t in widgets if loc.get(k) == "unten"]
+            rows = [("CHATS", f'<span foreground="{left}" weight="bold">%s</span>'),
+                    ("▶ " + chat_name, f'<span foreground="{left}">%s</span>'),
+                    ("  Anderer Chat", f'<span foreground="{left}">%s</span>')]
+            rows += [(t, f'<span foreground="{left}">%s</span>') for t in side]
+            chat = [(f"❯ das tippst du", f'<span foreground="{typed}">%s</span>'),
+                    ("", "%s"),
+                    ("● Antwort von " + tool, f'<span foreground="{answer}">%s</span>'),
+                    ("  https://beispiel.link", f'<span foreground="{link}">%s</span>'),
+                    ("", "%s")]
+            lines = []
+            for n in range(max(len(rows), len(chat))):
+                lt, lf = rows[n] if n < len(rows) else ("", "%s")
+                ct, cf = chat[n] if n < len(chat) else ("", "%s")
+                esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;")
+                lines.append(lf % esc(lt.ljust(24)) + "│ " + cf % esc(ct))
+            status = "   ".join(foot) or "(Status unten leer)"
+            bar = (f'<span background="{top}" foreground="#1e1e2e" weight="bold"> {badge} </span> '
+                   f'<span foreground="{bottom}">{status}</span>')
+            self.codex_preview_labels[base + 1].set_markup(
+                f'<span font_family="monospace" background="{bg}" foreground="{fg}">' + "\n".join(lines) + '</span>')
+            self.codex_preview_labels[base + 2].set_markup(bar)
+            self.codex_preview_labels[base + 3].set_text("")
+
+    def page_hotkeys(self):
+        grid = self.grid()
+        intro = Gtk.Label(label="Kürzel anklicken und eintippen oder mit „Aufnehmen“ direkt drücken. "
+                                "Eine Folge wie „^,1“ heißt: erst ^, dann 1 (innerhalb von 1,2 s). Leer = deaktiviert.", xalign=0)
+        intro.set_line_wrap(True)
+        grid.attach(intro, 0, grid.row, 2, 1); grid.row += 1
+        self.build_key_test(grid)
+        title = Gtk.Label(label="Terminal-Studio", xalign=0)
+        title.get_style_context().add_class("title")
+        grid.attach(title, 0, grid.row, 2, 1); grid.row += 1
+        for action, label in STUDIO_HOTKEY_LABELS.items():
+            self.hotkey_row(grid, label, "studioShortcuts", action)
+        title = Gtk.Label(label="QTerminal – alle Aktionen", xalign=0)
+        title.get_style_context().add_class("title")
+        grid.attach(title, 0, grid.row, 2, 1); grid.row += 1
+        for key in sorted(self.c["terminalShortcuts"], key=lambda x: unquote(x).lower()):
+            self.hotkey_row(grid, unquote(key), "terminalShortcuts", key)
+        self.mark_hotkey_conflicts()
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(grid)
+        return scroll
+
+    def hotkey_row(self, grid, label, group, action):
+        entry = Gtk.Entry(text=self.c[group].get(action, ""))
+        entry.set_width_chars(20)
+        self.hotkey_entries[(group, action)] = (entry, label)
+
+        def changed(widget):
+            self.c[group][action] = widget.get_text().strip()
+            self.mark_hotkey_conflicts()
+        entry.connect("changed", changed)
+        record = Gtk.Button(label="Aufnehmen")
+        record.connect("clicked", self.record_hotkey, entry, group, action)
+        reset = Gtk.Button(label="↺")
+        reset.set_tooltip_text("Auf Standard zurücksetzen" if group == "studioShortcuts"
+                               else "Auf den Wert von vorhin zurücksetzen")
+        reset.connect("clicked", lambda _b: entry.set_text(self.hotkey_default(group, action)))
+        row = Gtk.Box(spacing=6)
+        row.pack_start(entry, True, True, 0)
+        row.pack_start(record, False, False, 0)
+        row.pack_start(reset, False, False, 0)
+        self.row(grid, label, row)
+
+    def record_hotkey(self, button, entry, group=None, action=None):
+        self.finish_recording()
+        single = group == "studioShortcuts" and action in ("copy", "paste")   # dort nur Einzeltasten
+        self.recording_hotkey = {"button": button, "entry": entry, "first": None,
+                                 "single": single, "timer": None}
+        button.set_label("Taste drücken …")
+        button.grab_focus()
+
+    def record_step(self, hotkey):
+        rec = self.recording_hotkey
+        if rec["first"] is None:
+            rec["first"] = hotkey
+            if rec["single"]:
+                self.finish_recording()
+                return
+            rec["button"].set_label(f"{hotkey} … weitere Taste? ({SEQUENCE_WINDOW:.1f} s)")
+            rec["timer"] = GLib.timeout_add(int(SEQUENCE_WINDOW * 1000), lambda: self.finish_recording(True))
+        else:
+            rec["first"] = rec["first"] + "," + hotkey
+            self.finish_recording()
+
+    def finish_recording(self, from_timer=False):
+        rec = self.recording_hotkey
+        if not rec:
+            return False
+        self.recording_hotkey = None
+        if rec["timer"] and not from_timer:
+            GLib.source_remove(rec["timer"])
+        if rec["first"]:
+            rec["entry"].set_text(rec["first"])
+        rec["button"].set_label("Aufnehmen")
+        return False
+
+    def hotkey_default(self, group, action):
+        if group == "studioShortcuts":
+            return DEFAULTS["studioShortcuts"].get(action, "")
+        return self.hotkey_initial.get(action, "")
+
+    def mark_hotkey_conflicts(self):
+        seen = {}
+        for (group, _action), (entry, label) in self.hotkey_entries.items():
+            value = entry.get_text().strip()
+            if value:
+                seen.setdefault((group, value), []).append(label)
+        for (group, _action), (entry, label) in self.hotkey_entries.items():
+            value = entry.get_text().strip()
+            others = [name for name in seen.get((group, value), []) if name != label] if value else []
+            context = entry.get_style_context()
+            (context.add_class if others else context.remove_class)("konflikt")
+            entry.set_tooltip_text(("Schon belegt von: " + ", ".join(others)) if others else None)
+
+    def describe_hotkey(self, text):
+        treffer = []
+        for action, value in self.c["studioShortcuts"].items():
+            if value == text:
+                treffer.append(f"{STUDIO_HOTKEY_LABELS.get(action, action)} (Studio)")
+        for name, value in self.c["terminalShortcuts"].items():
+            if value == text:
+                treffer.append(f"{unquote(name)} (QTerminal)")
+        teile = ["belegt von: " + ", ".join(treffer) if treffer else "frei"]
+        steps = parse_binding(text)
+        if len(steps) > 1:
+            einzeln = [STUDIO_HOTKEY_LABELS.get(a, a) for a, v in self.c["studioShortcuts"].items() if v == steps[0]]
+            if einzeln:
+                teile.append(f"Achtung: {steps[0]} ist auch einzeln belegt ({', '.join(einzeln)})")
+        if text in KEY_HINTS:
+            teile.append(KEY_HINTS[text])
+        return " · ".join(teile)
+
+    def build_key_test(self, grid):
+        self.test_entry = Gtk.Entry()
+        self.test_entry.set_editable(False)
+        self.test_entry.set_placeholder_text("Hier eine Taste oder Folge drücken …")
+        self.test_entry.set_width_chars(24)
+        self.test_result = Gtk.Label(label="", xalign=0)
+        self.test_result.set_line_wrap(True)
+        self.test_entry.connect("key-press-event", self.key_test_event)
+        box = Gtk.Box(spacing=10)
+        box.pack_start(self.test_entry, False, False, 0)
+        box.pack_start(self.test_result, True, True, 0)
+        self.row(grid, "Tastentest", box)
+
+    def key_test_event(self, _widget, event):
+        hotkey = self.event_hotkey(event)
+        if not hotkey:
+            return True
+        now = time.monotonic()
+        last = self.test_last
+        text = f"{last[0]},{hotkey}" if last and now - last[1] <= SEQUENCE_WINDOW else hotkey
+        self.test_last = (text if "," not in text else hotkey, now)
+        self.test_entry.set_text(text)
+        self.test_result.set_text(self.describe_hotkey(text))
+        return True
+
+    def show_sequence_hint(self, action):
+        steps = parse_binding(self.c["studioShortcuts"].get(action))
+        pending = self.sequences.pending
+        naechste = steps[pending[1]] if pending and pending[1] < len(steps) else ""
+        self.set_title(f"Terminal-Studio – {steps[0]} gedrückt · jetzt {naechste}: "
+                       f"{STUDIO_HOTKEY_LABELS.get(action, action)}")
+        if action == "close":
+            self.get_style_context().add_class("close-pending")
+        if self.hint_source:
+            GLib.source_remove(self.hint_source)
+        self.hint_source = GLib.timeout_add(int(SEQUENCE_WINDOW * 1000) + 100, self.hint_timeout)
+
+    def hint_timeout(self):
+        self.hint_source = None
+        self.reset_sequence_hint()
+        return False
+
+    def clear_sequence_hint(self):
+        if self.hint_source:
+            GLib.source_remove(self.hint_source)
+            self.hint_source = None
+        self.reset_sequence_hint()
+
+    def reset_sequence_hint(self):
+        if self.get_title() != "Terminal-Studio":
+            self.set_title("Terminal-Studio")
+        self.get_style_context().remove_class("close-pending")
+
+    def run_studio_action(self, action):
+        if action == "close":
+            self.confirm_close()
+        elif action == "save":
+            self.save(None, False)
+        elif action == "test":
+            self.save(None, True)
+        elif action == "preview":
+            self.open_large_banner_preview(None)
+
+    def event_hotkey(self, event):
+        key = Gdk.keyval_name(event.keyval) or ""
+        aliases = {"Prior": "PgUp", "Next": "PgDown", "Page_Up": "PgUp", "Page_Down": "PgDown",
+                   "Insert": "Ins", "Delete": "Del", "space": "Space", "plus": "+", "minus": "-",
+                   "comma": "Comma", "dead_circumflex": "^", "asciicircum": "^"}
+        key = aliases.get(key, key.upper() if len(key) == 1 else key)
+        if key in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R"):
+            return ""
+        parts = []
+        if event.state & Gdk.ModifierType.CONTROL_MASK:
+            parts.append("Ctrl")
+        if event.state & Gdk.ModifierType.MOD1_MASK:
+            parts.append("Alt")
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            parts.append("Shift")
+        if event.state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("Meta")
+        return "+".join(parts + [key])
+
+    def page_design(self):
+        g = self.grid()
+        self.design_cb = Gtk.ComboBoxText()
+        for k, t in [("Red", "Rot-Schwarz (Hacker-Kali)"), ("Purple", "Lila"), ("Blue", "Blau"), ("Green", "Grün"),
+                     ("Orange", "Orange"), ("Pink", "Pink"), ("Teal", "Türkis"), ("Yellow", "Gelb"), ("Slate", "Grau")]:
+            self.design_cb.append(k, t)
+        self.design_cb.set_active_id("Red")
+        self.row(g, "Farbe für Fenster und Symbole", self.design_cb,
+                 "Ändert Fenster, Symbole und Programm-Farben. Offene Programme übernehmen es nach dem Neustart.")
+        ok = Gtk.Button(label="Design anwenden"); ok.get_style_context().add_class("save")
+        ok.connect("clicked", self.design_run, "apply")
+        back = Gtk.Button(label="Vorheriges Design wiederherstellen"); back.connect("clicked", self.design_run, "back")
+        box = Gtk.Box(spacing=8); box.pack_start(ok, False, False, 0); box.pack_start(back, False, False, 0)
+        self.row(g, "", box)
+        return g
+
+    def design_run(self, _b, what):
+        arg = self.design_cb.get_active_id() if what == "apply" else "zurueck"
+        r = subprocess.run(["/usr/local/bin/design-apply", arg], capture_output=True, text=True)
+        self.msg(r.stdout.strip() + "\nOffene Programme bitte einmal neu starten." if r.returncode == 0
+                 else "Nicht geändert: " + (r.stderr.strip() or "Fehler"))
+
+    # ---------- Logik ----------
+    def rgba(self, h):
+        r = Gdk.RGBA(); r.parse(h); return r
+
+    def set(self, key, val):
+        if self.building:
+            return
+        self.c[key] = val
+        if key == "fontSize":
+            for scale in self.font_scales:
+                if int(scale.get_value()) != val:
+                    scale.set_value(val)
+        if key in ("fontFamily", "LogoPreviewSize"):
+            self.apply_banner_preview_font()
+        if key == "TerminalTransparency" and val == 100 and self.c["TerminalBackgroundImage"]:
+            self.c["TerminalBackgroundImage"] = ""
+            self.w["bgimg"].set_active_id("")
+        self.preview.queue_draw()
+
+    def preview_preset(self, _widget, _event, name):
+        self.preview_override = dict(self.c)
+        self.preview_override.update(self.profile_c(name))
+        self.preview.queue_draw()
+        return False
+
+    def clear_preview_override(self, _widget, _event):
+        self.preview_override = None
+        self.preview.queue_draw()
+        return False
+
+    def set_banner(self, key, val):
+        self.b[key] = val
+        self.update_banner_preview()
+
+    def banner_color_changed(self, btn, key):
+        r = btn.get_rgba()
+        self.b[key] = "#%02x%02x%02x" % (int(r.red * 255), int(r.green * 255), int(r.blue * 255))
+        self.rainbow_switch.set_active(False)
+        self.update_banner_preview()
+
+    def key_pressed(self, _widget, event):
+        hotkey = self.event_hotkey(event)
+        if self.recording_hotkey:
+            if hotkey:
+                self.record_step(hotkey)
+            return True
+        if self.test_entry is not None and self.get_focus() is self.test_entry:
+            return False              # im Tastentest schaltet keine Taste etwas aus
+        actions = self.c["studioShortcuts"]
+        if hotkey == "Alt+A":
+            focus = self.get_focus()
+            if not isinstance(focus, (Gtk.Entry, Gtk.TextView)):
+                focus = self.last_text_focus
+            if isinstance(focus, Gtk.Entry):
+                focus.select_region(0, -1)
+                return True
+            if isinstance(focus, Gtk.TextView):
+                buf = focus.get_buffer()
+                buf.select_range(buf.get_start_iter(), buf.get_end_iter())
+                return True
+        if hotkey:
+            state, action = self.sequences.feed(hotkey, actions)
+            if state == "wartet":
+                self.show_sequence_hint(action)
+                return True
+            self.clear_sequence_hint()
+            if state == "treffer":
+                self.run_studio_action(action)
+                return True
+        if hotkey and hotkey == actions.get("close"):
+            self.confirm_close()
+            return True
+        if hotkey in (actions.get("copy"), actions.get("paste")) and hotkey:
+            focus = self.get_focus()
+            if isinstance(focus, Gtk.TextView):
+                clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                if hotkey == actions.get("copy"):
+                    focus.get_buffer().copy_clipboard(clipboard)
+                elif focus.get_editable():
+                    focus.get_buffer().paste_clipboard(clipboard, None, True)
+                return True
+            if isinstance(focus, Gtk.Entry):
+                if hotkey == actions.get("copy"):
+                    focus.copy_clipboard()
+                else:
+                    focus.paste_clipboard()
+                return True
+        if hotkey == actions.get("save") and hotkey:
+            self.save(None, False); return True
+        if hotkey == actions.get("test") and hotkey:
+            self.save(None, True); return True
+        if hotkey == actions.get("preview") and hotkey:
+            self.open_large_banner_preview(None); return True
+        return False
+
+    def remember_text_focus(self, _window, widget):
+        if isinstance(widget, (Gtk.Entry, Gtk.TextView)):
+            self.last_text_focus = widget
+
+    def confirm_delete(self, _widget, _event):
+        return False                    # keine Speichern-Nachfrage: Fenster schliesst einfach (Nutzerwunsch)
+
+    def flash_close_border(self, window):
+        context = window.get_style_context()
+        state = {"on": False}
+        def tick():
+            if not window.get_visible():
+                context.remove_class("close-pending")
+                return False
+            state["on"] = not state["on"]
+            (context.add_class if state["on"] else context.remove_class)("close-pending")
+            return True
+        tick()
+        return GLib.timeout_add(300, tick)
+
+    def stop_close_border(self, window, source):
+        if source:
+            GLib.source_remove(source)
+        window.get_style_context().remove_class("close-pending")
+
+    def run_closable_dialog(self, dialog, keep_alive=False):
+        state = {"pending": False, "flash": None}
+        def on_key(_widget, event):
+            if Gdk.keyval_name(event.keyval) not in ("Escape", "dead_circumflex", "asciicircum"):
+                return False
+            if state["pending"]:
+                dialog.response(Gtk.ResponseType.CANCEL)
+            else:
+                state["pending"] = True
+                state["flash"] = self.flash_close_border(dialog)
+                dialog.set_title("Nochmal ^: schließen")
+            return True
+        dialog.connect("key-press-event", on_key)
+        response = dialog.run()
+        self.stop_close_border(dialog, state["flash"])
+        if not keep_alive:
+            dialog.destroy()
+        return response
+
+    def confirm_close(self):
+        self.destroy()                  # ^,1 schliesst sofort, ohne Nachfrage (Nutzerwunsch)
+        return
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text="Terminal-Studio wirklich schließen?")
+        d.format_secondary_text("^ speichert und schließt das Studio. „Zurück“ bricht ab.")
+        d.add_button("Zurück", Gtk.ResponseType.CANCEL)
+        d.add_button("Ohne Speichern schließen", Gtk.ResponseType.NO)
+        d.add_button("Speichern & Schließen", Gtk.ResponseType.YES)
+        def second_escape(dialog, event):
+            if Gdk.keyval_name(event.keyval) in ("Escape", "dead_circumflex", "asciicircum"):
+                dialog.response(Gtk.ResponseType.YES)
+                return True
+            return False
+        d.connect("key-press-event", second_escape)
+        flash = self.flash_close_border(self)
+        response = d.run()
+        self.stop_close_border(self, flash)
+        d.destroy()
+        if response == Gtk.ResponseType.YES:
+            if not self.save(None, False, quiet=True):
+                return
+            self.destroy()
+        elif response == Gtk.ResponseType.NO:
+            self.destroy()
+
+    def logo_choices_list(self):
+        choices = [(key, label) for key, (label, _path) in LOGO_ARTS.items()
+                   if key in ("aus", "custom") or key not in self.hidden_logos]
+        choices.extend(("user:" + item["id"], item["name"]) for item in self.own_logos)
+        return choices
+
+    def hide_builtin_logo(self, _button):
+        key = self.b.get("LOGO_ART", "")
+        if key not in LOGO_ARTS or key in ("aus", "custom"):
+            self.logo_status.set_text("Wähle zuerst ein vorinstalliertes Logo aus.")
+            return
+        self.hidden_logos.add(key)
+        self.b["HIDDEN_LOGOS"] = ",".join(sorted(self.hidden_logos))
+        self.b["LOGO_ART"] = "aus"
+        self.refresh_logo_choices()
+        self.update_banner_preview()
+        self.logo_status.set_text("Logo aus der Auswahl entfernt. Du kannst es wiederherstellen.")
+
+    def restore_builtin_logos(self, _button):
+        self.hidden_logos.clear()
+        self.b["HIDDEN_LOGOS"] = ""
+        self.refresh_logo_choices()
+        self.logo_status.set_text("Vorinstallierte Logos sind wieder auswählbar.")
+
+    def refresh_logo_choices(self):
+        for child in self.logo_choices.get_children():
+            child.destroy()
+        self.fill_hover_choice(self.logo_choices, "LOGO_ART", self.logo_choices_list())
+        self.logo_choices.show_all()
+
+    def paste_logo(self, _button):
+        text = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text()
+        if text:
+            self.custom_logo_buffer.set_text(text)
+            self.logo_status.set_text("Eingefügt. Gib dem Bild einen Namen und klicke auf „Als Option speichern“.")
+        else:
+            self.logo_status.set_text("In der Zwischenablage ist kein Textbild.")
+
+    def add_own_logo(self, _button):
+        source = self.preview_logo_name if _button is self.preview_logo_save else self.logo_name_entry
+        name = source.get_text().strip()
+        art = self.current_custom_logo_text().rstrip("\n")
+        if not name or not art or art.startswith("Fuege im Terminal-Studio"):
+            self.logo_status.set_text("Bitte zuerst einen Namen eingeben und ein Textbild einfügen.")
+            return
+        item = {"id": uuid.uuid4().hex, "name": name[:60], "art": art}
+        self.own_logos.append(item)
+        self.b["LOGO_ART"] = "user:" + item["id"]
+        self.logo_name_entry.set_text("")
+        self.preview_logo_name.set_text("")
+        self.refresh_logo_choices()
+        self.update_banner_preview()
+        if self.save(None, False, quiet=True):
+            self.logo_status.set_text("„%s“ ist gespeichert und als Option auswählbar." % item["name"])
+        else:
+            self.logo_status.set_text("Speichern fehlgeschlagen. Versuch es unten erneut mit „Speichern“.")
+
+    def remove_own_logo(self, _button):
+        key = self.b.get("LOGO_ART", "")
+        if not key.startswith("user:"):
+            self.logo_status.set_text("Wähle zuerst eines deiner eigenen Logos aus.")
+            return
+        removed = next((item for item in self.own_logos if "user:" + item["id"] == key), None)
+        self.own_logos = [item for item in self.own_logos if "user:" + item["id"] != key]
+        if removed and self.current_custom_logo_text().rstrip("\n") == removed["art"].rstrip("\n"):
+            self.custom_logo_buffer.set_text("")
+        self.b["LOGO_ART"] = "aus"
+        self.banner_preview_override = None
+        self.refresh_logo_choices()
+        self.update_banner_preview()
+        if self.save(None, False, quiet=True):
+            self.logo_status.set_text("Eigenes Logo gelöscht.")
+        else:
+            self.logo_status.set_text("Löschen noch nicht gespeichert. Versuch es unten erneut mit „Speichern“.")
+
+    # ---------- Profile ----------
+    def profile_names(self):
+        versteckt = set(self.profiles["hidden"])
+        return [n for n in PRESETS if n not in versteckt] + list(self.profiles["own"])
+
+    def profile_c(self, name):
+        if name in self.profiles["own"]:
+            return self.profiles["own"][name].get("c", {})
+        return PRESETS.get(name, {})
+
+    def profile_b(self, name):
+        if name in self.profiles["own"]:
+            return self.profiles["own"][name].get("b", {})
+        return {}
+
+    def build_profile_buttons(self):
+        for child in self.profile_flow.get_children():
+            child.destroy()
+        self.preset_buttons = []
+        for name in self.profile_names():
+            b = Gtk.Button(label=name)
+            if name in self.profiles["own"]:
+                b.set_tooltip_text("Mein Profil")
+            b.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+            b.connect("enter-notify-event", self.preview_preset, name)
+            b.connect("leave-notify-event", self.clear_preview_override)
+            b.connect("clicked", self.apply_preset, name)
+            self.profile_flow.add(b)
+            self.preset_buttons.append(b)
+        self.profile_flow.show_all()
+
+    def profile_snapshot(self):
+        return {"c": {k: json.loads(json.dumps(self.c[k])) for k in PROFILE_C_KEYS if k in self.c},
+                "b": {k: str(self.b[k]) for k in PROFILE_B_KEYS if k in self.b}}
+
+    def profile_speichern(self, name):
+        """Speichert den aktuellen Stand unter einem Namen. Gibt eine Fehlermeldung oder None zurück."""
+        name = clean_profile_name(name)
+        if not name:
+            return "Bitte einen Namen eingeben."
+        if name in PRESETS:
+            return "Diesen Namen gibt es schon als Vorlage. Nimm einen anderen Namen."
+        self.profiles["own"][name] = self.profile_snapshot()
+        save_profiles(self.profiles)
+        self.build_profile_buttons()
+        return None
+
+    def profile_loeschen(self, names):
+        """Eigene Profile werden gelöscht, Vorlagen nur ausgeblendet."""
+        for name in names:
+            if name in self.profiles["own"]:
+                del self.profiles["own"][name]
+            elif name in PRESETS and name not in self.profiles["hidden"]:
+                self.profiles["hidden"].append(name)
+        save_profiles(self.profiles)
+        self.build_profile_buttons()
+
+    def profile_speichern_dialog(self, _b):
+        d = Gtk.Dialog(title="Als Profil speichern", transient_for=self, modal=True)
+        d.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        d.add_button("Speichern", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8); box.set_border_width(12)
+        text = Gtk.Label(label="Name für dein Profil.\nGespeichert werden Schrift, Farben, Hintergrund, Cursor und Logo.", xalign=0)
+        entry = Gtk.Entry(); entry.set_activates_default(True); entry.set_placeholder_text("z. B. Mein Rot")
+        box.pack_start(text, False, False, 0); box.pack_start(entry, False, False, 0)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.show_all()
+        antwort = self.run_closable_dialog(d, keep_alive=True)
+        name = clean_profile_name(entry.get_text())
+        d.destroy()
+        if antwort != Gtk.ResponseType.OK:
+            return
+        if name in self.profiles["own"]:
+            q = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                  buttons=Gtk.ButtonsType.NONE, text=f"Profil „{name}“ überschreiben?")
+            q.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+            q.add_button("Überschreiben", Gtk.ResponseType.OK)
+            if self.run_closable_dialog(q) != Gtk.ResponseType.OK:
+                return
+        fehler = self.profile_speichern(name)
+        self.msg(fehler or f"Profil „{name}“ ist gespeichert und steht oben in der Zeile „Profile“.\n"
+                           "Damit deine Terminals so aussehen, klicke danach auf „Speichern“.")
+
+    def profile_loeschen_dialog(self, _b):
+        d = Gtk.Dialog(title="Profile löschen", transient_for=self, modal=True)
+        d.set_default_size(440, 380)
+        box = d.get_content_area()
+        box.set_spacing(8); box.set_border_width(12)
+        hinweis = Gtk.Label(label="Wähle die Profile, die weg sollen (mehrere möglich).\n"
+                                  "Vorlagen werden nur ausgeblendet und lassen sich zurückholen.", xalign=0)
+        box.pack_start(hinweis, False, False, 0)
+        speicher = Gtk.ListStore(str, str)
+        ansicht = Gtk.TreeView(model=speicher)
+        for i, titel in enumerate(("Profil", "Art")):
+            ansicht.append_column(Gtk.TreeViewColumn(titel, Gtk.CellRendererText(), text=i))
+        ansicht.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        rolle = Gtk.ScrolledWindow(); rolle.set_vexpand(True); rolle.add(ansicht)
+        box.pack_start(rolle, True, True, 0)
+
+        def fuellen():
+            speicher.clear()
+            for n in self.profile_names():
+                speicher.append([n, "mein Profil" if n in self.profiles["own"] else "Vorlage"])
+        fuellen()
+        d.add_button("Schließen", Gtk.ResponseType.CANCEL)
+        d.add_button("Ausgewählte löschen", Gtk.ResponseType.OK)
+        d.show_all()
+        while True:
+            antwort = self.run_closable_dialog(d, keep_alive=True)
+            if antwort != Gtk.ResponseType.OK:
+                break
+            modell, pfade = ansicht.get_selection().get_selected_rows()
+            namen = [modell[p][0] for p in pfade]
+            if not namen:
+                hinweis.set_text("Bitte zuerst ein Profil anklicken.")
+                continue
+            self.profile_loeschen(namen)
+            fuellen()
+            hinweis.set_text(f"{len(namen)} Profil(e) entfernt.")
+        d.destroy()
+
+    def profile_zurueckholen(self, _b):
+        if not self.profiles["hidden"]:
+            self.msg("Es sind keine Vorlagen ausgeblendet.")
+            return
+        self.profiles["hidden"] = []
+        save_profiles(self.profiles)
+        self.build_profile_buttons()
+        self.msg("Die eingebauten Vorlagen sind wieder da.")
+
+    # ---------- Eigene Logos verwalten ----------
+    def eigene_logos_loeschen(self, ids):
+        """Entfernt eigene Logos aus dem Studio (gespeichert wird danach mit save). Gibt die Anzahl zurück."""
+        ids = set(ids)
+        entfernt = [i for i in self.own_logos if i["id"] in ids]
+        if not entfernt:
+            return 0
+        self.own_logos = [i for i in self.own_logos if i["id"] not in ids]
+        aktuell = self.current_custom_logo_text().rstrip("\n")
+        if any(i["art"].rstrip("\n") == aktuell for i in entfernt):
+            self.custom_logo_buffer.set_text("")
+        art = self.b.get("LOGO_ART", "")
+        if art.startswith("user:") and art[5:] in ids:
+            self.b["LOGO_ART"] = "aus"
+        self.banner_preview_override = None
+        self.refresh_logo_choices()
+        self.update_banner_preview()
+        return len(entfernt)
+
+    def logos_verwalten_dialog(self, _b):
+        d = Gtk.Dialog(title="Eigene Logos verwalten", transient_for=self, modal=True)
+        d.set_default_size(460, 420)
+        box = d.get_content_area()
+        box.set_spacing(8); box.set_border_width(12)
+        hinweis = Gtk.Label(label="Wähle Logos zum Löschen (mehrere möglich). Gespeichert wird beim Schließen.", xalign=0)
+        box.pack_start(hinweis, False, False, 0)
+        speicher = Gtk.ListStore(str, str)
+        ansicht = Gtk.TreeView(model=speicher)
+        ansicht.append_column(Gtk.TreeViewColumn("Logo", Gtk.CellRendererText(), text=1))
+        ansicht.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        rolle = Gtk.ScrolledWindow(); rolle.set_vexpand(True); rolle.add(ansicht)
+        box.pack_start(rolle, True, True, 0)
+
+        def fuellen():
+            speicher.clear()
+            for i in self.own_logos:
+                speicher.append([i["id"], i["name"]])
+            hinweis.set_text(f"{len(self.own_logos)} eigene Logos." if self.own_logos else "Keine eigenen Logos gespeichert.")
+        fuellen()
+        d.add_button("Schließen", Gtk.ResponseType.CANCEL)
+        d.add_button("Alle löschen", 2)
+        d.add_button("Ausgewählte löschen", Gtk.ResponseType.OK)
+        d.show_all()
+        geloescht = 0
+        while True:
+            antwort = self.run_closable_dialog(d, keep_alive=True)
+            if antwort == 2:
+                q = Gtk.MessageDialog(transient_for=d, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                      buttons=Gtk.ButtonsType.NONE, text="Wirklich ALLE eigenen Logos löschen?")
+                q.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+                q.add_button("Alle löschen", Gtk.ResponseType.OK)
+                if self.run_closable_dialog(q) == Gtk.ResponseType.OK:
+                    geloescht += self.eigene_logos_loeschen([i["id"] for i in self.own_logos])
+                    fuellen()
+                continue
+            if antwort != Gtk.ResponseType.OK:
+                break
+            modell, pfade = ansicht.get_selection().get_selected_rows()
+            ids = [modell[p][0] for p in pfade]
+            if not ids:
+                hinweis.set_text("Bitte zuerst ein Logo anklicken.")
+                continue
+            geloescht += self.eigene_logos_loeschen(ids)
+            fuellen()
+        d.destroy()
+        if geloescht:
+            if self.save(None, False, quiet=True):
+                self.logo_status.set_text(f"{geloescht} Logo(s) gelöscht und gespeichert.")
+            else:
+                self.logo_status.set_text("Gelöscht, aber noch nicht gespeichert. Versuch es mit „Speichern“ erneut.")
+
+    def hover_choice(self, config_key, choices):
+        box = Gtk.FlowBox()
+        box.set_selection_mode(Gtk.SelectionMode.NONE)
+        box.set_max_children_per_line(3)
+        box.set_row_spacing(4); box.set_column_spacing(4)
+        self.fill_hover_choice(box, config_key, choices)
+        return box
+
+    def fill_hover_choice(self, box, config_key, choices):
+        current = self.b.get(config_key, "")
+        for value, label in choices:
+            button = Gtk.Button(label=label)
+            button.get_style_context().add_class("flat")
+            if value == current:
+                button.get_style_context().add_class("suggested-action")
+            button.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+            button.connect("enter-notify-event", self.preview_banner_choice, config_key, value)
+            button.connect("leave-notify-event", self.clear_banner_choice_preview)
+            button.connect("clicked", self.choose_banner_value, config_key, value)
+            box.add(button)
+
+    def preview_banner_choice(self, _widget, _event, config_key, value):
+        self.banner_preview_override = {config_key: value}
+        self.update_banner_preview()
+        return False
+
+    def clear_banner_choice_preview(self, _widget, _event):
+        self.banner_preview_override = None
+        self.update_banner_preview()
+        return False
+
+    def choose_banner_value(self, _widget, config_key, value):
+        self.b[config_key] = value
+        self.banner_preview_override = None
+        if config_key == "LOGO_ART":
+            self.refresh_logo_choices()
+        self.update_banner_preview()
+
+    def update_banner_preview(self):
+        if getattr(self, "banner_preview_buffer", None) is not None:
+            custom_text = self.current_custom_logo_text() if getattr(self, "custom_logo_buffer", None) is not None else None
+            banner = dict(self.b)
+            if self.banner_preview_override:
+                banner.update(self.banner_preview_override)
+            editing = self.b.get("LOGO_ART") == "custom" and not self.banner_preview_override
+            self.banner_view.set_editable(editing)
+            self.banner_view.set_cursor_visible(editing)
+            if getattr(self, "preview_logo_tools", None) is not None:
+                self.preview_logo_tools.set_visible(editing and self.notebook.get_current_page() == 4)
+            text = custom_text if editing else render_banner_text(banner, custom_text, self.own_logos)
+            width = max((len(line) for line in (text or "").splitlines()), default=0)
+            self.preview_width_hint.set_text(
+                "Bildbreite: %d Spalten. Ein neues QTerminal-Fenster wird bei Bedarf verbreitert." % width)
+            self._updating_banner_preview = True
+            try:
+                self.banner_preview_buffer.set_text(text or "")
+            finally:
+                self._updating_banner_preview = False
+            self.apply_banner_preview_colors(banner, editing)
+            self.apply_banner_preview_font()
+        self.preview.queue_draw()
+
+    def banner_preview_changed(self, buffer):
+        if getattr(self, "_updating_banner_preview", False) or getattr(self, "custom_logo_buffer", None) is None:
+            return
+        text = buffer.get_text(*buffer.get_bounds(), True)
+        width = max((len(line) for line in text.splitlines()), default=0)
+        self.preview_width_hint.set_text(
+            "Bildbreite: %d Spalten. Ein neues QTerminal-Fenster wird bei Bedarf verbreitert." % width)
+        self.apply_banner_preview_colors(self.b, True)
+        self._editing_banner_preview = True
+        try:
+            self.custom_logo_buffer.set_text(text)
+        finally:
+            self._editing_banner_preview = False
+
+    def apply_banner_preview_colors(self, banner, editing):
+        buffer = self.banner_preview_buffer
+        start, end = buffer.get_bounds()
+        buffer.remove_all_tags(start, end)
+        if editing:
+            logo_lines = buffer.get_line_count()
+        else:
+            key = banner.get("LOGO_ART", "aus")
+            if key == "custom":
+                logo = self.current_custom_logo_text()
+            elif key.startswith("user:"):
+                logo = next((item["art"] for item in self.own_logos if "user:" + item["id"] == key), "")
+            else:
+                logo = logo_art(key)
+            logo_lines = len(logo.splitlines()) if key != "aus" else 0
+        rainbow = banner.get("REGENBOGEN") == "ja"
+        palette = ("#ff5555", "#ffaa55", "#f5dd55", "#77dd88", "#66bbff", "#bb88ff")
+        for line in range(buffer.get_line_count()):
+            color = palette[line % len(palette)] if rainbow else banner["LOGO_COLOR" if line < logo_lines else "BANNER_COLOR"]
+            vf = [x for x in banner.get("LOGO_FARBEN", "").split(",") if x]
+            if not rainbow and vf and line < logo_lines:
+                try:
+                    import logo_farben
+                    color = logo_farben.verlauf_farbe(vf, line, logo_lines)
+                except Exception:
+                    pass
+            tag = self._preview_color_tags.get(color)
+            if tag is None:
+                tag = buffer.create_tag(None, foreground=color)
+                self._preview_color_tags[color] = tag
+            a = buffer.get_iter_at_line(line)
+            b = buffer.get_iter_at_line(line + 1) if line + 1 < buffer.get_line_count() else buffer.get_end_iter()
+            buffer.apply_tag(tag, a, b)
+
+    def banner_preview_resized(self, _widget, _allocation):
+        if self.fit_banner:
+            self.apply_banner_preview_font()
+
+    def toggle_fit_banner(self, _button):
+        self.fit_banner = not self.fit_banner
+        self.fit_button.set_label("Originalgröße" if self.fit_banner else "Ganz einpassen")
+        self.apply_banner_preview_font()
+
+    def apply_banner_preview_font(self):
+        size = int(self.c["LogoPreviewSize"])
+        if self.fit_banner:
+            text = self.banner_preview_buffer.get_text(*self.banner_preview_buffer.get_bounds(), True)
+            layout = self.banner_view.create_pango_layout(text)
+            layout.set_font_description(Pango.FontDescription(f"{self.c['fontFamily']} {size}"))
+            width, height = layout.get_pixel_size()
+            available_w = max(1, self.banner_scroll.get_allocated_width() - 28)
+            available_h = max(1, self.banner_scroll.get_allocated_height() - 28)
+            scale = min(1.0, available_w / max(1, width), available_h / max(1, height))
+            size = max(2, int(size * scale))
+        font = Pango.FontDescription(f"{self.c['fontFamily']} {size}")
+        if self.banner_view.get_style_context() and font.to_string() != getattr(self, "_banner_font", None):
+            self.banner_view.override_font(font)
+            self._banner_font = font.to_string()
+
+    def custom_logo_changed(self):
+        if self._editing_banner_preview:
+            return
+        if self.b.get("LOGO_ART") != "custom":
+            self.b["LOGO_ART"] = "custom"
+            self.refresh_logo_choices()
+        self.update_banner_preview()
+
+    def switch_preview_page(self, _notebook, _page, index):
+        boot = index == getattr(self, "boot_tab_index", -1)
+        extra = getattr(self, "extra_previews", {}).get(index)
+        self.preview_stack.set_visible_child_name(
+            "banner" if index == 4 else "codex" if index == 8 else "boot" if boot else extra or "terminal")
+        self.preview_heading.set_text("KI-Terminal-Vorschau rechts" if index == 8 else
+                                      "Ladebildschirm-Vorschau (ungefähr)" if boot else
+                                      "Desktop-Bild-Vorschau" if extra == "wall" else
+                                      "Vorschau rechts – großes Bild: scrollen")
+        self.fit_button.set_visible(index == 4)
+        self.full_button.set_visible(index == 4)
+        if index == 4 and self.b.get("LOGO_ART") == "custom":
+            self.preview_logo_tools.show_all()
+        else:
+            self.preview_logo_tools.hide()
+        self.preview_width_hint.set_visible(index == 4)
+        self.update_codex_preview()
+        self.preview.queue_draw()
+
+    def open_large_banner_preview(self, _button):
+        if self.notebook.get_current_page() != 4:
+            self.notebook.set_current_page(4)
+        dialog = Gtk.Dialog(title="Banner-Vorschau", transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_button("Schließen", Gtk.ResponseType.CLOSE)
+        view = Gtk.TextView.new_with_buffer(self.banner_preview_buffer)
+        if self.b.get("LOGO_ART") == "custom":
+            view = Gtk.TextView()
+            view.get_buffer().set_text(render_banner_text(self.b, self.current_custom_logo_text(), self.own_logos))
+        view.set_editable(False); view.set_cursor_visible(False)
+        view.set_monospace(True); view.set_wrap_mode(Gtk.WrapMode.NONE)
+        view.override_font(Pango.FontDescription(
+            f"{self.c['fontFamily']} {self.c['LogoPreviewSize']}"))
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(view)
+        dialog.get_content_area().add(scroll)
+        dialog.set_default_size(1100, 700)
+        dialog.show_all(); self.run_closable_dialog(dialog)
+
+    def make_fully_transparent(self, _button):
+        self.w["TerminalTransparency"].set_value(100)
+        self.w["bgimg"].set_active_id("")
+
+    def current_custom_logo_text(self):
+        if getattr(self, "custom_logo_buffer", None) is None:
+            return load_custom_logo()
+        start, end = self.custom_logo_buffer.get_bounds()
+        return self.custom_logo_buffer.get_text(start, end, True)
+
+    def custom_color(self, btn, k):
+        r = btn.get_rgba()
+        self.c["custom"][k] = "#%02x%02x%02x" % (int(r.red * 255), int(r.green * 255), int(r.blue * 255))
+        if self.c["colorScheme"] != "Eigenes":
+            self.w["colorScheme"].set_active_id("Eigenes")
+        self.preview.queue_draw()
+
+    def ansi_color_changed(self, btn, index):
+        r = btn.get_rgba()
+        self.c["custom"]["ansi"][index] = "#%02x%02x%02x" % (
+            int(r.red * 255), int(r.green * 255), int(r.blue * 255))
+        self.w["colorScheme"].set_active_id("Eigenes")
+        self.preview.queue_draw()
+
+    def input_color_changed(self, btn):
+        r = btn.get_rgba()
+        self.b["INPUT_COLOR"] = "#%02x%02x%02x" % (int(r.red * 255), int(r.green * 255), int(r.blue * 255))
+        self.preview.queue_draw()
+
+    def color_palette(self, target):
+        box = Gtk.FlowBox()
+        box.set_selection_mode(Gtk.SelectionMode.NONE)
+        box.set_max_children_per_line(4)
+        for name, color in TEXT_COLORS:
+            button = Gtk.Button(label=name)
+            button.connect("clicked", self.pick_text_color, target, color)
+            box.add(button)
+        return box
+
+    def color_styles(self):
+        box = Gtk.FlowBox()
+        box.set_selection_mode(Gtk.SelectionMode.NONE)
+        box.set_max_children_per_line(3)
+        for name in TEXT_STYLES:
+            button = Gtk.Button(label=name)
+            button.connect("clicked", self.pick_text_style, name)
+            box.add(button)
+        return box
+
+    def pick_text_style(self, _button, name):
+        bg, fg, input_color, accent = TEXT_STYLES[name]
+        self.c["custom"].update(bg=bg, fg=fg, accent=accent)
+        self.c["custom"]["ansi"] = default_ansi(self.c["custom"])
+        self.b["INPUT_COLOR"] = input_color
+        for key, color in (("bg", bg), ("fg", fg), ("accent", accent)):
+            self.custom_buttons[key].set_rgba(self.rgba(color))
+        self.input_color_button.set_rgba(self.rgba(input_color))
+        for i, button in enumerate(self.ansi_buttons):
+            button.set_rgba(self.rgba(self.c["custom"]["ansi"][i]))
+        self.w["colorScheme"].set_active_id("Eigenes")
+        self.preview.queue_draw()
+
+    def pick_text_color(self, _button, target, color):
+        if target == "input":
+            self.b["INPUT_COLOR"] = color
+            self.input_color_button.set_rgba(self.rgba(color))
+        else:
+            self.c["custom"]["fg"] = color
+            self.output_color_button.set_rgba(self.rgba(color))
+            self.w["colorScheme"].set_active_id("Eigenes")
+        self.preview.queue_draw()
+
+    def bg_changed(self, cb):
+        v = cb.get_active_id()
+        if v == "__folder__":
+            d = Gtk.FileChooserDialog(title="Bilderordner wählen", parent=self,
+                                      action=Gtk.FileChooserAction.SELECT_FOLDER)
+            d.add_buttons("Abbrechen", Gtk.ResponseType.CANCEL, "Ordner wählen", Gtk.ResponseType.OK)
+            if self.c.get("BackgroundImageFolder"):
+                d.set_current_folder(self.c["BackgroundImageFolder"])
+            response = self.run_closable_dialog(d, keep_alive=True)
+            folder = d.get_filename() if response == Gtk.ResponseType.OK else None
+            d.destroy()
+            if folder:
+                self.c["BackgroundImageFolder"] = folder
+                images = self.add_folder_images(cb, folder)
+                if images:
+                    cb.set_active_id(images[0])
+                    return
+                self.msg("In diesem Ordner wurden keine Bilder gefunden.")
+            cb.set_active_id(self.c["TerminalBackgroundImage"])
+            return
+        if v == "__logo__":
+            try:
+                sys.path.insert(0, "/usr/local/lib/terminal-studio-mods")
+                import logo_hintergrund
+                def art_von(key):
+                    if key == "custom":
+                        return self.current_custom_logo_text()
+                    if key.startswith("user:"):
+                        return next((i["art"] for i in self.own_logos if "user:" + i["id"] == key), "")
+                    return logo_art(key)
+                png = logo_hintergrund.dialog(self, self.logo_choices_list(), art_von)
+            except Exception as fehler:
+                self.msg("Logo-Hintergrund ging nicht: %s" % fehler); png = None
+            if png:
+                cb.append(png, "Text-Logo (Mitte)")
+                self.c["TerminalBackgroundMode"] = 2
+                if self.w.get("TerminalBackgroundMode"):
+                    self.w["TerminalBackgroundMode"].set_active_id("2")
+                cb.set_active_id(png)
+            else:
+                cb.set_active_id(self.c["TerminalBackgroundImage"])
+            return
+        if v == "__file__":
+            d = Gtk.FileChooserDialog(title="Bild wählen", parent=self, action=Gtk.FileChooserAction.OPEN)
+            d.add_buttons("Abbrechen", Gtk.ResponseType.CANCEL, "Öffnen", Gtk.ResponseType.OK)
+            f = Gtk.FileFilter(); f.set_name("Bilder"); f.add_mime_type("image/*"); d.add_filter(f)
+            response = self.run_closable_dialog(d, keep_alive=True)
+            if response == Gtk.ResponseType.OK:
+                v = d.get_filename(); cb.append(v, os.path.basename(v))
+            else:
+                v = self.c["TerminalBackgroundImage"]
+            d.destroy()
+            cb.set_active_id(v); return
+        self.set("TerminalBackgroundImage", v or "")
+
+    def apply_preset(self, _b, name):
+        for key, value in self.profile_c(name).items():
+            if key not in PROFILE_C_KEYS:
+                continue
+            alt = self.c.get(key)
+            zahl = (int, float)
+            if alt is not None and type(value) is not type(alt) and not (
+                    isinstance(value, zahl) and isinstance(alt, zahl) and
+                    not isinstance(value, bool) and not isinstance(alt, bool)):
+                continue                      # falscher Typ in einer Profil-Datei: ignorieren
+            self.c[key] = json.loads(json.dumps(value))
+        b_update = self.profile_b(name)
+        for key in PROFILE_B_KEYS:
+            if key in b_update:
+                self.b[key] = str(b_update[key])
+        art = self.b.get("LOGO_ART", "")
+        if art.startswith("user:") and not any("user:" + i["id"] == art for i in self.own_logos):
+            self.b["LOGO_ART"] = "aus"        # dieses eigene Logo wurde inzwischen gelöscht
+        self.preview_override = None
+        self.refresh_widgets()
+        if b_update:
+            self.rebuild_banner_page()
+
+    def rebuild_banner_page(self):
+        seite = self.notebook.get_current_page()
+        self.notebook.remove_page(4)
+        self.notebook.insert_page(self.page_banner(), Gtk.Label(label="Banner & tmux"), 4)
+        self.notebook.show_all()
+        self.notebook.set_current_page(seite)
+
+    def reset_all(self, _b):
+        d = Gtk.MessageDialog(transient_for=self, message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.YES_NO,
+                              text="Wirklich alles auf Standard zurück?")
+        d.format_secondary_text("Schrift, Farben, Hintergrund, Cursor, Banner, Leiste, Codex, Desktop-Bild und Sperre & Energie "
+                                "gehen auf die Ausgangswerte. Die Leiste und das Terminal übernehmen es mit „Speichern“, "
+                                "Sperre & Energie gilt sofort.")
+        antwort = d.run(); d.destroy()
+        if antwort != Gtk.ResponseType.YES:
+            return
+        self.reset(_b)
+        if hasattr(self, "sperre_standard"):
+            self.sperre_standard()
+        if hasattr(self, "wall_standard"):
+            self.wall_standard()
+
+    def reset(self, _b):
+        self.c = json.loads(json.dumps(DEFAULTS))
+        self.codex_ui = json.loads(json.dumps(CODEX_DEFAULTS))
+        self.c["custom"]["ansi"] = default_ansi(self.c["custom"])
+        self.c["custom"]["fg_bright"] = "#ffffff"
+        self.refresh_widgets()
+
+    def refresh_widgets(self):
+        self.building = True
+        for k, wd in self.w.items():
+            if k == "bgimg":
+                v = self.c["TerminalBackgroundImage"]
+                if not wd.set_active_id(v):
+                    wd.append(v, os.path.basename(v)); wd.set_active_id(v)
+            elif isinstance(wd, Gtk.Scale):
+                wd.set_value(self.c[k])
+            elif isinstance(wd, Gtk.Switch):
+                wd.set_active(self.c[k])
+            elif isinstance(wd, Gtk.ComboBoxText):
+                wd.set_active_id(str(self.c[k]))
+        self.building = False
+        for key, button in self.custom_buttons.items():
+            button.set_rgba(self.rgba(self.c["custom"][key]))
+        for index, button in enumerate(self.ansi_buttons):
+            button.set_rgba(self.rgba(self.c["custom"]["ansi"][index]))
+        for scale in self.font_scales:
+            scale.set_value(self.c["fontSize"])
+        self.apply_banner_preview_font()
+        for key, combo in self.codex_color_combos.items():
+            combo.set_active_id(self.codex_ui[key])
+            self.codex_color_buttons[key].set_rgba(self.rgba(self.codex_ui["custom_colors"][key]))
+        for key, button in self.codex_terminal_buttons.items():
+            value = (self.b["INPUT_COLOR"] if key == "input" else
+                     self.c["custom"]["ansi"][{"link": 4, "error": 1, "success": 2}[key]]
+                     if key in ("link", "error", "success") else self.c["custom"][key])
+            button.set_rgba(self.rgba(value))
+        for key, widget in self.codex_switches.items():
+            widget.set_active(self.codex_ui[key])
+            self.codex_position_combos[key].set_active_id(self.codex_ui["locations"][key])
+        for key, button in getattr(self, "chat_input_buttons", {}).items():
+            button.set_rgba(self.rgba(self.codex_ui.get(key) or self.c["custom"]["fg"]))
+        self.codex_summary_switch.set_active(self.codex_ui["chat_summary"])
+        self.codex_summary_spin.set_value(self.codex_ui["summary_lines"])
+        self.codex_animation_combo.set_active_id(self.codex_ui["animation"])
+        self.codex_limit_combo.set_active_id(self.codex_ui["limit_display"])
+        self.update_codex_preview()
+        self.preview.queue_draw()
+
+    def colors(self):
+        if self.c["colorScheme"] == "Eigenes":
+            cu = self.c["custom"]; ansi = cu["ansi"]
+            return (hex2rgb(cu["bg"]), hex2rgb(cu["fg"]), hex2rgb(ansi[1]),
+                    hex2rgb(ansi[2]), hex2rgb(ansi[4]))
+        return read_scheme(self.c["colorScheme"])
+
+    def draw_preview(self, area, cr):
+        W, H = area.get_allocated_width(), area.get_allocated_height()
+        if self.preview_override is not None and self.notebook.get_current_page() != 4:
+            preview_c = self.preview_override
+            if preview_c.get("colorScheme") == "Eigenes":
+                cu = preview_c["custom"]; bg = hex2rgb(cu["bg"]); fg = hex2rgb(cu["fg"])
+                red, green, blue = (hex2rgb(cu["ansi"][i]) for i in (1, 2, 4))
+            else:
+                bg, fg, red, green, blue = read_scheme(preview_c["colorScheme"])
+        else:
+            preview_c = self.c
+            bg, fg, red, green, blue = self.colors()
+        cr.set_source_rgb(.25, .25, .25); cr.paint()  # "Desktop" hinter dem Fenster
+        a = 1 - preview_c["TerminalTransparency"] / 100
+        img = preview_c["TerminalBackgroundImage"]
+        cr.save(); cr.rectangle(10, 10, W - 20, H - 20); cr.clip()
+        if img and os.path.exists(img):
+            try:
+                from gi.repository import GdkPixbuf
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(img, W - 20, H - 20, False)
+                Gdk.cairo_set_source_pixbuf(cr, pb, 10, 10); cr.paint()
+                a = min(a, .35)
+            except Exception:
+                pass
+        cr.set_source_rgba(*bg, a); cr.paint(); cr.restore()
+        if img and os.path.exists(img) and preview_c.get("BackgroundImageDim", 0):
+            cr.save(); cr.rectangle(10, 10, W - 20, H - 20); cr.clip()
+            cr.set_source_rgba(0, 0, 0, preview_c["BackgroundImageDim"] / 100)
+            cr.paint(); cr.restore()
+        cr.set_source_rgb(*red); cr.set_line_width(1); cr.rectangle(10.5, 10.5, W - 21, H - 21); cr.stroke()
+
+        m = 10 + preview_c["TerminalMargin"]
+        lay = PangoCairo.create_layout(cr)
+        lay.set_font_description(Pango.FontDescription(f"{preview_c['fontFamily']} {preview_c['fontSize']}"))
+        lines = [
+            [(red, "┌──("), (blue, "DEIN_BENUTZER㉿kali"), (red, ")-["), (fg, "~/projekt"), (red, "]")],
+            [(red, "└─$ "), (hex2rgb(self.b["INPUT_COLOR"]), "claude")],
+            [(green, "✔ "), (fg, "Build fertig in 12s")],
+            [(red, "✘ "), (fg, "Fehler: Datei fehlt")],
+            [(fg, "ls  "), (blue, "src/  "), (green, "run.sh  "), (fg, "README.md")],
+            [(blue, "https://example.org"), (fg, "  Link")],
+            [(red, "└─$ ")],
+        ]
+        y = m + 4
+        for parts in lines:
+            x = m + 4
+            for col, txt in parts:
+                lay.set_text(txt, -1); cr.move_to(x, y); cr.set_source_rgb(*col); PangoCairo.show_layout(cr, lay)
+                x += lay.get_pixel_size()[0]
+            y += lay.get_pixel_size()[1] + 2
+        # Cursor
+        lay.set_text("█", -1); cw, ch = lay.get_pixel_size(); y -= ch + 2; x -= 0
+        cr.set_source_rgb(*fg); shape = preview_c["KeyboardCursorShape"]
+        if shape == 0: cr.rectangle(x, y + 2, cw, ch - 2)
+        elif shape == 1: cr.rectangle(x, y + ch - 3, cw, 3)
+        else: cr.rectangle(x, y + 2, 2, ch - 2)
+        cr.fill()
+        if preview_c["colorScheme"] == "Eigenes":
+            swatches = preview_c["custom"]["ansi"]
+            for index, value in enumerate(swatches):
+                row, column = divmod(index, 4)
+                lay.set_text("%02d %s" % (index, ANSI_NAMES[index % 8][:5]), -1)
+                cr.set_source_rgb(*hex2rgb(value))
+                cr.move_to(m + 4 + column * max(90, (W - 2 * m - 8) / 4), y + ch + 16 + row * (ch + 5))
+                PangoCairo.show_layout(cr, lay)
+
+    def save(self, _b, test, quiet=False):
+        c = dict(self.c)
+        c["codex_ui"] = self.codex_ui
+        c["terminal_style"] = {
+            "config": dict(self.b),
+            "logos": {name: (self.current_custom_logo_text() if name == "custom" else logo_art(name))
+                      for name in LOGO_ARTS if name != "aus"},
+            "own_logos": list(self.own_logos),
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(c, f); tmp = f.name
+        os.chmod(tmp, 0o644)
+        cmd = ["/usr/local/bin/terminal-studio-apply", tmp]
+        if os.geteuid() != 0:
+            cmd = ["pkexec"] + cmd
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        os.unlink(tmp)
+        if r.returncode != 0:
+            self.msg("Nicht gespeichert:\n" + (r.stderr.strip() or "Abgebrochen")); return False
+        if test:
+            subprocess.Popen(["/usr/local/bin/qterminal-studio"], start_new_session=True)
+        elif not quiet:
+            self.msg("Gespeichert! Jedes neue Terminal-Fenster sieht jetzt so aus.")
+        return True
+
+    def msg(self, text):
+        d = Gtk.MessageDialog(transient_for=self, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text=text)
+        self.run_closable_dialog(d)
+
+
+if __name__ == "__main__":
+    Studio(); Gtk.main()

@@ -1,0 +1,35 @@
+#!/bin/bash
+# design-apply <Farbe|zurueck|status>   Farbe = Red Green Blue Orange Pink Purple Slate Teal Yellow
+# Setzt GTK-Theme, Icons, Fensterrahmen und Qt-Farben für DEIN_BENUTZER (und Qt für root). Original wird einmal gesichert.
+U=DEIN_BENUTZER; H=/home/$U; S=$H/.config/salah/design-vorher; MERK=$S/werte.txt
+xa(){ if [ "$(id -un)" = "$U" ]; then env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus DISPLAY=$(/usr/local/bin/aktuelles-display) "$@"
+      else sudo -u $U env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus DISPLAY=$(/usr/local/bin/aktuelles-display) XAUTHORITY=$H/.Xauthority HOME=$H "$@"; fi; }
+setqt(){ f=$1; col=$2; ico=$3; ver=$4  # Datei, Farbschema, Icon, qt5ct|qt6ct
+  [ -f "$f" ] || return
+  sed -i "s|^color_scheme_path=.*|color_scheme_path=/usr/share/$ver/colors/$col.conf|; s|^icon_theme=.*|icon_theme=$ico|" "$f"; }
+case "$1" in
+ status) xa xfconf-query -c xsettings -p /Net/ThemeName; xa xfconf-query -c xsettings -p /Net/IconThemeName; exit 0;;
+ zurueck)
+   [ -f "$MERK" ] || { echo "Kein gesicherter Stand da." >&2; exit 1; }
+   . "$MERK"; GTK=$G; ICO=$I; WM=$W; QC=$QC; QI=$QI;;
+ Red|Green|Blue|Orange|Pink|Purple|Slate|Teal|Yellow)
+   if [ ! -f "$MERK" ]; then
+     mkdir -p "$S"
+     { echo "G=$(xa xfconf-query -c xsettings -p /Net/ThemeName)"; echo "I=$(xa xfconf-query -c xsettings -p /Net/IconThemeName)"
+       echo "W=$(xa xfconf-query -c xfwm4 -p /general/theme)"
+       echo "QC=$(sed -n 's|^color_scheme_path=/usr/share/qt6ct/colors/||;s|\.conf$||p' $H/.config/qt6ct/qt6ct.conf|head -1)"
+       echo "QI=$(sed -n 's|^icon_theme=||p' $H/.config/qt6ct/qt6ct.conf|head -1)"; } > "$MERK"
+     chown -R $U:$U "$S" 2>/dev/null
+   fi
+   GTK=Kali-$1-Dark; ICO=Flat-Remix-$1-Dark; WM=Kali-$1-Dark; QC=Kali-$1-Dark; QI=Flat-Remix-$1-Dark
+   [ -d /usr/share/themes/$GTK ] && [ -d /usr/share/icons/$ICO ] || { echo "Theme $1 fehlt" >&2; exit 1; };;
+ *) echo "Aufruf: design-apply Red|Green|Blue|Orange|Pink|Purple|Slate|Teal|Yellow|zurueck|status"; exit 2;;
+esac
+xa xfconf-query -c xsettings -p /Net/ThemeName -s "$GTK"
+xa xfconf-query -c xsettings -p /Net/IconThemeName -s "$ICO"
+xa xfconf-query -c xfwm4 -p /general/theme -s "$WM"
+for v in 5 6; do setqt $H/.config/qt${v}ct/qt${v}ct.conf "$QC" "$QI" qt${v}ct; done
+[ -d /root/.config/qt6ct ] && [ "$(id -u)" = 0 ] && setqt /root/.config/qt6ct/qt6ct.conf "$QC" "$QI" qt6ct
+# gtk-3.0 settings.ini (für Programme ohne xsettings)
+sed -i "s|^gtk-theme-name=.*|gtk-theme-name=$GTK|; s|^gtk-icon-theme-name=.*|gtk-icon-theme-name=$ICO|" $H/.config/gtk-3.0/settings.ini 2>/dev/null
+echo "Design gesetzt: $GTK / $ICO"

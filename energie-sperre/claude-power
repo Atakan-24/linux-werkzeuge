@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""claude-power: PC automatisch in Energiesparmodus / Ruhezustand / Herunterfahren,
+sobald ALLE Claude-Code-Sitzungen fertig sind.
+
+Benutzung:
+  claude-power suspend      # nach Fertigstellung -> Energiesparmodus (Standby)
+  claude-power hibernate    # nach Fertigstellung -> Ruhezustand
+  claude-power shutdown     # nach Fertigstellung -> Herunterfahren
+  claude-power off          # deaktivieren
+  claude-power cancel       # laufenden Countdown abbrechen (Modus bleibt aktiv)
+  claude-power status       # Modus + aktive Sitzungen anzeigen
+  claude-power delay 120    # Countdown-Sekunden setzen (Standard 60)
+  claude-power now          # sofort prüfen (z.B. zum Testen)
+  claude-power lid 30       # Deckel zu + 30 Min. keine Claude-Arbeit -> Ruhezustand (0 = aus)
+  claude-power lid-action suspend|hibernate|shutdown   # was nach der Deckel-Wartezeit passiert
+  claude-power idle                  # Leerlauf-Automatik: Status (Schwellen, Leerlaufzeit, "am Coden"?)
+  claude-power idle on|off           # Leerlauf-Automatik ein/aus
+  claude-power idle ac 45            # Minuten ohne Eingabe am Netz -> Bereitschaft (danach Ruhezustand)
+  claude-power idle bat 20           # dasselbe im Akkubetrieb
+
+Intern (von Claude-Code-Hooks aufgerufen):
+  claude-power hook busy|idle|end   (JSON auf stdin)
+"""
+import glob, json, os, signal, subprocess, sys, time
+
+BASE = os.path.expanduser("~/.claude/power")
+SESS = os.path.join(BASE, "sessions")
+CONF = os.path.join(BASE, "config.json")
+PIDF = os.path.join(BASE, "countdown.pid")
+LOG = os.path.join(BASE, "log.txt")
+# Einstellungen aus dem Terminal-Studio (Reiter "Sperre & Energie"); ueberschreiben nur diese Schluessel
+UI_CONF = "/var/lib/claude-power-ui/ui.json"
+UI_KEYS = {"lid_minutes": "int", "lid_action": "action", "lid_lock": "bool", "idle_enabled": "bool",
+           "idle_ac_min": "int", "idle_bat_min": "int", "idle_action": "action", "idle_warn_s": "int",
+           "idle_lock": "bool"}
+ACTIONS = {
+    "suspend": ["systemctl", "suspend"],
+    "hibernate": ["systemctl", "hibernate"],
+    "shutdown": ["systemctl", "poweroff"],
+    "suspend-then-hibernate": ["systemctl", "suspend-then-hibernate"],
+}
+LABEL = {"suspend": "Energiesparmodus", "hibernate": "Ruhezustand", "shutdown": "Herunterfahren",
+         "suspend-then-hibernate": "Bereitschaft, danach Ruhezustand", "off": "aus"}
+
+
+def log(msg):
+    os.makedirs(BASE, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def conf():
+    try:
+        with open(CONF) as f:
+            c = json.load(f)
+    except Exception:
+        c = {}
+    c.setdefault("mode", "off")
+    c.setdefault("delay", 60)
+    c.setdefault("lid_minutes", 30)
+    c.setdefault("lid_action", "hibernate")
+    c.setdefault("idle_enabled", True)
+    c.setdefault("idle_ac_min", 45)
+    c.setdefault("idle_bat_min", 20)
+    c.setdefault("idle_action", "suspend-then-hibernate")
+    c.setdefault("idle_warn_s", 60)
+    c.setdefault("lid_lock", True)
+    c.setdefault("idle_lock", True)
+    try:
+        with open(UI_CONF) as f:
+            ui = json.load(f)
+    except Exception:
+        ui = {}
+    for k, kind in UI_KEYS.items():
+        v = ui.get(k)
+        if kind == "bool" and isinstance(v, bool):
+            c[k] = v
+        elif kind == "int" and isinstance(v, int) and not isinstance(v, bool):
+            c[k] = max(0, min(v, 100000))
+        elif kind == "action" and v in ACTIONS:
+            c[k] = v
+    return c
+
+
+def save_conf(c):
+    os.makedirs(BASE, exist_ok=True)
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(c, f)
+    os.replace(tmp, CONF)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def is_claude(pid):
+    """Interaktiver Claude-Code-Prozess (keine bg-spare/bg-pty-host Hilfsprozesse)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [x.decode(errors="ignore") for x in f.read().split(b"\0") if x]
+    except Exception:
+        return False
+    if not argv or os.path.basename(argv[0]) not in ("claude", "claude.exe"):
+        return False
+    return not any(x.startswith(("bg-", "--bg-")) for x in argv[1:])
+
+
+def claude_pids():
+    return [int(d) for d in os.listdir("/proc") if d.isdigit() and is_claude(int(d))]
+
+
+def claude_ancestor():
+    """PID des claude-Prozesses finden, der diesen Hook gestartet hat."""
+    pid = os.getppid()
+    for _ in range(15):
+        if is_claude(pid):
+            return pid
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+        if pid <= 1:
+            break
+    return os.getppid()
+
+
+def busy_sessions():
+    """Aktive (arbeitende) Sitzungen; tote Einträge werden aufgeräumt."""
+    out, known = [], set()
+    os.makedirs(SESS, exist_ok=True)
+    for name in os.listdir(SESS):
+        p = os.path.join(SESS, name)
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not alive(d.get("pid", 0)):
+            os.remove(p)
+            continue
+        known.add(d.get("pid"))
+        if d.get("state") == "busy":
+            out.append(d)
+    # Sicherheit: laufende Sitzungen ohne Eintrag (vor der Einrichtung gestartet
+    # oder noch keine Nachricht seitdem) zählen als "arbeitet".
+    for pid in claude_pids():
+        if pid not in known:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except Exception:
+                cwd = ""
+            out.append({"pid": pid, "state": "busy", "cwd": cwd + "  (unbekannt – schick ihr eine Nachricht oder beende sie)"})
+    return out
+
+
+# --- Einschlaf-Sperre: solange Claude arbeitet, kein automatischer Schlaf bei Inaktivität ---
+GUARD = os.path.join(BASE, "idle-guard.json")
+XFPM_PROPS = ["/xfce4-power-manager/inactivity-on-battery", "/xfce4-power-manager/inactivity-on-ac"]
+
+
+def desktop_user():
+    """(user, uid) der grafischen Sitzung."""
+    try:
+        import pwd
+        out = subprocess.run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[3] == "seat0":
+                return f[2], int(f[1])
+    except Exception:
+        pass
+    return None, None
+
+
+def xfconf(args):
+    user, uid = desktop_user()
+    if not user:
+        return None
+    env = ["env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"]
+    cmd = (["runuser", "-u", user, "--"] if os.geteuid() == 0 else []) + env + ["xfconf-query", "-c", "xfce4-power-manager"] + args
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def idle_guard(on):
+    """on=True: Inaktivitäts-Schlaf aus (Werte merken). on=False: Werte wiederherstellen."""
+    if on and not os.path.exists(GUARD):
+        saved = {p: xfconf(["-p", p]) for p in XFPM_PROPS}
+        with open(GUARD, "w") as f:
+            json.dump(saved, f)
+        for p in XFPM_PROPS:
+            xfconf(["-p", p, "-s", "0"])
+        log("einschlaf-sperre AN (Claude arbeitet)")
+    elif not on and os.path.exists(GUARD):
+        with open(GUARD) as f:
+            saved = json.load(f)
+        for p, v in saved.items():
+            if v not in (None, ""):
+                xfconf(["-p", p, "-s", v])
+        os.remove(GUARD)
+        log("einschlaf-sperre AUS (alle fertig)")
+
+
+def update_guard():
+    idle_guard(bool(busy_sessions()))
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-u", "critical", "-a", "Claude Power", "Claude Power", msg],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["wall", "[claude-power] " + msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def countdown_running():
+    try:
+        with open(PIDF) as f:
+            return alive(int(f.read().strip()))
+    except Exception:
+        return False
+
+
+def cancel_countdown():
+    try:
+        with open(PIDF) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    try:
+        os.remove(PIDF)
+    except FileNotFoundError:
+        pass
+
+
+def maybe_start_countdown():
+    c = conf()
+    if c["mode"] not in ACTIONS or busy_sessions() or countdown_running():
+        return
+    # Countdown als eigenständigen Hintergrundprozess starten (überlebt den Hook)
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_countdown"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def run_countdown():
+    os.makedirs(BASE, exist_ok=True)
+    with open(PIDF, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        c = conf()
+        mode, delay = c["mode"], int(c["delay"])
+        if mode not in ACTIONS:
+            return
+        notify(f"Alle Claude-Sitzungen fertig. {LABEL[mode]} in {delay}s. Abbrechen: claude-power cancel")
+        log(f"countdown start: {mode} in {delay}s")
+        end = time.time() + delay
+        while time.time() < end:
+            time.sleep(2)
+            if conf()["mode"] != mode:
+                log("countdown abgebrochen: Modus geändert")
+                return
+            if busy_sessions():
+                log("countdown abgebrochen: Sitzung wieder aktiv")
+                notify("Countdown abgebrochen – eine Claude-Sitzung arbeitet wieder.")
+                return
+        # Einmalig: Modus zurücksetzen, damit der PC nach dem Aufwachen nicht erneut ausgeht
+        c = conf(); c["mode"] = "off"; save_conf(c)
+        idle_guard(False)
+        log(f"führe aus: {mode}")
+        if os.environ.get("CLAUDE_POWER_DRYRUN"):
+            log("DRYRUN: " + " ".join(ACTIONS[mode]))
+        else:
+            subprocess.run(ACTIONS[mode])
+    finally:
+        try:
+            os.remove(PIDF)
+        except FileNotFoundError:
+            pass
+
+
+# --- Deckel-Wächter: Deckel zu + lange keine Claude-Arbeit -> Ruhezustand ---
+def lid_closed():
+    try:
+        for d in os.listdir("/proc/acpi/button/lid"):
+            with open(f"/proc/acpi/button/lid/{d}/state") as f:
+                if "closed" in f.read():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def lock_screen():
+    user, uid = desktop_user()
+    if user and xfconf(["-p", "/xfce4-power-manager/lock-screen-suspend-hibernate"]) == "false":
+        log("Sperre ist im Terminal-Studio ausgeschaltet -> nicht gesperrt")
+        return
+    if user:
+        # Nicht "dm-tool lock": LightDM 1.32 bleibt danach in der Anmeldeschleife haengen (Passwort geht nicht).
+        # Stattdessen der Sperrbildschirm des Desktops (xfce4-screensaver).
+        env = ["env", "DISPLAY=" + (subprocess.run(["/usr/local/bin/aktuelles-display", user], capture_output=True, text=True).stdout.strip() or ":0.0"), f"XAUTHORITY=/home/{user}/.Xauthority", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+               f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"]
+        subprocess.run(["runuser", "-u", user, "--", *env, "xfce4-screensaver-command", "--lock"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def lidwatch(max_loops=None):
+    """Läuft dauerhaft (systemd-Dienst claude-power-lid)."""
+    since = None
+    was_closed = False
+    loops = 0
+    while max_loops is None or loops < max_loops:
+        loops += 1
+        c = conf()
+        mins = int(c["lid_minutes"])
+        closed = lid_closed()
+        if closed and not was_closed:
+            if c["lid_lock"]:
+                log("deckel zu -> Bildschirm sperren")
+                lock_screen()
+        was_closed = closed
+        # "arbeitet" nur bei frischem Claude-Transkript oder laufender Codex-Sitzung; haengende
+        # Eintraege und Prozesse ohne Aktivitaet blockieren den Ruhezustand nicht mehr.
+        if mins > 0 and lid_closed() and not busy_reason():
+            if since is None:
+                since = time.time(); log(f"deckel zu, keine Claude-/Codex-Arbeit -> {c['lid_action']} in {mins} min")
+            elif time.time() - since >= mins * 60:
+                log(f"deckel-wächter: führe aus: {c['lid_action']}")
+                idle_guard(False)
+                if c["lid_lock"]:
+                    lock_screen()
+                if os.environ.get("CLAUDE_POWER_DRYRUN"):
+                    log("DRYRUN: " + " ".join(ACTIONS[c["lid_action"]]))
+                else:
+                    subprocess.run(ACTIONS[c["lid_action"]])
+                since = None
+                time.sleep(60 if max_loops is None else 0)  # nach dem Aufwachen kurz Ruhe
+        else:
+            if since is not None:
+                log("deckel-wächter: zurückgesetzt (Deckel offen oder es wird gecodet)")
+            since = None
+        time.sleep(20 if max_loops is None else 0)
+
+
+# --- Leerlauf-Wächter: keine Eingabe + niemand codet -> Bereitschaft, spaeter Ruhezustand ---
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+CODEX_START = ("task_started", "turn_started")
+CODEX_END = ("task_complete", "turn_aborted", "turn_complete")
+CODEX_MAX_AGE = 3 * 3600      # aelter als 3 h: "arbeitet" gilt als haengengeblieben
+
+
+def codex_zustand(pfad):
+    """'working', solange das letzte Lebenszyklus-Ereignis ein Start ist (wie chats/codex-chats)."""
+    try:
+        with open(pfad, "rb") as f:
+            f.seek(max(0, os.path.getsize(pfad) - 262144))
+            zeilen = f.read().splitlines()
+        for z in reversed(zeilen):
+            try:
+                art = json.loads(z).get("payload", {}).get("type")
+            except (ValueError, AttributeError):
+                continue
+            if art in CODEX_END:
+                return "done"
+            if art in CODEX_START:
+                return "working"
+    except OSError:
+        pass
+    return "done"
+
+
+def codex_running():
+    """Laeuft irgendein Codex-Prozess (Programm heisst 'codex')?"""
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/comm") as f:
+                    if f.read().strip() == "codex":
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+def codex_busy(now=None):
+    """Liste der Rollout-Dateien, in denen Codex gerade arbeitet (leer = nichts zu tun)."""
+    now = now or time.time()
+    if not os.path.isdir(CODEX_SESSIONS) or not codex_running():
+        return []
+    out = []
+    for root, _dirs, files in os.walk(CODEX_SESSIONS):
+        for name in files:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                path = os.path.join(root, name)
+                try:
+                    age = now - os.path.getmtime(path)
+                except OSError:
+                    continue
+                if age < CODEX_MAX_AGE and codex_zustand(path) == "working":
+                    out.append(path)
+    return out
+
+
+CLAUDE_FRESH = 1800          # "arbeitet" nur, wenn das Transkript in den letzten 30 Min beschrieben wurde
+
+
+def transcript_age(sid, now=None):
+    """Sekunden seit der letzten Aenderung des Claude-Transkripts (None = nicht gefunden)."""
+    now = now or time.time()
+    try:
+        for path in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")):
+            return now - os.path.getmtime(path)
+    except OSError:
+        pass
+    return None
+
+
+def claude_busy_fresh(now=None):
+    """Arbeitende Claude-Sitzungen, aber nur mit frischem Transkript (haengende Eintraege zaehlen nicht)."""
+    now = now or time.time()
+    out, known = [], set()
+    try:
+        names = os.listdir(SESS)
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            with open(os.path.join(SESS, name)) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not alive(d.get("pid", 0)):
+            continue
+        known.add(d.get("pid"))
+        if d.get("state") != "busy":
+            continue
+        age = transcript_age(name, now)
+        if age is None:
+            age = now - float(d.get("t", 0))
+        if age < CLAUDE_FRESH:
+            out.append(d)
+    # Prozesse ohne Hook-Eintrag: nur mit Registry-Datei und frischem Transkript
+    for pid in claude_pids():
+        if pid in known:
+            continue
+        try:
+            with open(os.path.expanduser(f"~/.claude/sessions/{pid}.json")) as f:
+                sid = json.load(f).get("sessionId")
+        except Exception:
+            continue
+        age = transcript_age(sid, now) if sid else None
+        if age is not None and age < CLAUDE_FRESH:
+            out.append({"pid": pid, "state": "busy", "cwd": ""})
+    return out
+
+
+def busy_reason():
+    """Text, warum gerade gecodet wird (Claude oder Codex); leer = niemand."""
+    parts = []
+    b = claude_busy_fresh()
+    if b:
+        parts.append(f"Claude ({len(b)} Sitzung(en))")
+    cx = codex_busy()
+    if cx:
+        parts.append(f"Codex ({len(cx)} Sitzung(en))")
+    return " + ".join(parts)
+
+
+def on_ac():
+    try:
+        for d in sorted(os.listdir("/sys/class/power_supply")):
+            if d.startswith(("AC", "ADP")):
+                with open(f"/sys/class/power_supply/{d}/online") as f:
+                    return f.read().strip() == "1"
+    except OSError:
+        pass
+    return True
+
+
+def user_sessions():
+    """Benutzer-Sitzungen mit Anzeige: [{'user','uid','type','display','class'}] inkl. gesperrtem Zustand."""
+    out = []
+    try:
+        lst = subprocess.run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True).stdout
+        for line in lst.splitlines():
+            f = line.split()
+            if len(f) < 3:
+                continue
+            info = subprocess.run(["loginctl", "show-session", f[0], "-p", "Type", "-p", "Class", "-p",
+                                   "State", "-p", "Display", "-p", "Name", "-p", "User"],
+                                  capture_output=True, text=True).stdout
+            d = dict(x.split("=", 1) for x in info.splitlines() if "=" in x)
+            if d.get("Class") in ("user", "greeter") and d.get("Type") in ("x11", "wayland") \
+                    and d.get("State") in ("active", "online"):
+                out.append({"user": d.get("Name"), "uid": int(d.get("User", 0)), "type": d["Type"],
+                            "display": d.get("Display") or ":0", "class": d["Class"]})
+    except Exception:
+        pass
+    return out
+
+
+def graphical_session():
+    """Erste Benutzer-Sitzung (auch wenn gerade der Sperrbildschirm davor liegt)."""
+    return next((x for x in user_sessions() if x["class"] == "user"), None)
+
+
+_xdisplays = {}
+
+
+def _x_idle(display, xauth):
+    """Sekunden seit der letzten Eingabe auf diesem X-Display (None bei Fehler)."""
+    import ctypes
+    x11 = ctypes.CDLL("libX11.so.6")
+    xss = ctypes.CDLL("libXss.so.1")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+
+    class Info(ctypes.Structure):
+        _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int), ("kind", ctypes.c_int),
+                    ("til_or_since", ctypes.c_ulong), ("idle", ctypes.c_ulong), ("event_mask", ctypes.c_ulong)]
+    key = (display, xauth)
+    handle = _xdisplays.get(key)
+    if not handle:
+        os.environ["XAUTHORITY"] = xauth
+        handle = x11.XOpenDisplay(display.encode())
+        if not handle:
+            return None
+        _xdisplays[key] = handle
+    info = Info()
+    if not xss.XScreenSaverQueryInfo(handle, x11.XDefaultRootWindow(handle), ctypes.byref(info)):
+        _xdisplays.pop(key, None)
+        return None
+    return info.idle / 1000.0
+
+
+def x_idle_seconds():
+    """Kleinste Leerlaufzeit ueber Benutzer-Anzeige und Sperrbildschirm (Greeter); None = nicht messbar."""
+    if os.environ.get("CLAUDE_POWER_FAKE_IDLE"):
+        return float(os.environ["CLAUDE_POWER_FAKE_IDLE"])
+    values, wayland_user = [], False
+    try:
+        import pwd
+        for sess in user_sessions():
+            if sess["type"] != "x11":
+                wayland_user = wayland_user or sess["class"] == "user"
+                continue
+            if sess["class"] == "greeter":
+                xauth = f"/var/run/lightdm/root/{sess['display']}"
+            else:
+                xauth = os.path.join(pwd.getpwnam(sess["user"]).pw_dir, ".Xauthority")
+            try:
+                v = _x_idle(sess["display"], xauth)
+            except Exception:
+                v = None
+            if v is not None:
+                values.append(v)
+    except Exception:
+        return None
+    if wayland_user or not values:
+        return None      # Wayland/Hyprland: keine Leerlaufmessung -> kein Auto-Schlaf
+    return min(values)
+
+
+def notify_user(msg):
+    """Desktop-Meldung an den angemeldeten Benutzer (ohne wall in alle Terminals)."""
+    sess = graphical_session()
+    if not sess or os.environ.get("CLAUDE_POWER_DRYRUN"):
+        return
+    subprocess.run(["runuser", "-u", sess["user"], "--", "env",
+                    f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{sess['uid']}/bus",
+                    "notify-send", "-u", "critical", "-a", "Claude Power", "Claude Power", msg],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def idle_threshold(c):
+    return int(c["idle_ac_min" if on_ac() else "idle_bat_min"]) * 60
+
+
+def idlewatch(max_loops=None):
+    """Laeuft dauerhaft (systemd-Dienst claude-power-idle)."""
+    warned_at = None
+    unmeasurable_logged = False
+    loops = 0
+    while max_loops is None or loops < max_loops:
+        loops += 1
+        c = conf()
+        action = c["idle_action"] if c["idle_action"] in ACTIONS else "suspend-then-hibernate"
+        if not c["idle_enabled"]:
+            warned_at = None
+            time.sleep(30)
+            continue
+        idle = x_idle_seconds()
+        thr = idle_threshold(c)
+        busy = busy_reason() if idle is not None else ""
+        if idle is None:
+            if not unmeasurable_logged:
+                log("leerlauf-wächter: Leerlaufzeit nicht messbar (Wayland/kein X) – kein Auto-Schlaf")
+                unmeasurable_logged = True
+            warned_at = None
+        elif busy or idle < thr:
+            if warned_at is not None:
+                log("leerlauf-wächter: abgebrochen (" + (f"es wird gecodet: {busy}" if busy else "Eingabe erkannt") + ")")
+            warned_at = None
+        elif warned_at is None:
+            warned_at = time.time()
+            notify_user(f"Kein Betrieb seit {int(idle // 60)} Min. {LABEL[action]} in {int(c['idle_warn_s'])} s. "
+                        "Eine Taste oder Mausbewegung bricht ab.")
+            log(f"leerlauf-wächter: {int(idle)} s Leerlauf >= {thr} s, nichts am Coden -> {action} in {int(c['idle_warn_s'])} s")
+        elif time.time() - warned_at >= int(c["idle_warn_s"]):
+            log(f"leerlauf-wächter: führe aus: {action}")
+            if os.environ.get("CLAUDE_POWER_DRYRUN"):
+                log("DRYRUN: " + " ".join(ACTIONS[action]))
+            else:
+                if c["idle_lock"]:
+                    lock_screen()      # Passwort nach dem Aufwachen
+                subprocess.run(ACTIONS[action])
+            warned_at = None
+            time.sleep(60 if max_loops is None else 0)   # nach dem Aufwachen kurz Ruhe
+        time.sleep((5 if warned_at else 30) if max_loops is None else 0)
+
+
+def idle_status():
+    c = conf()
+    idle = x_idle_seconds()
+    sess = graphical_session()
+    print("Leerlauf-Automatik: " + ("AN" if c["idle_enabled"] else "aus")
+          + f"  (Netz {c['idle_ac_min']} Min / Akku {c['idle_bat_min']} Min -> {LABEL.get(c['idle_action'], c['idle_action'])})")
+    print(f"Stromquelle: {'Netz' if on_ac() else 'Akku'}  ->  Schwelle {idle_threshold(c) // 60} Min")
+    if sess:
+        print(f"Sitzung: {sess['user']} ({sess['type']})")
+    print("Leerlaufzeit: " + (f"{int(idle // 60)} Min {int(idle % 60)} s" if idle is not None
+                                else "nicht messbar (Wayland/Hyprland oder kein Display)"))
+    reason = busy_reason()
+    print("Am Coden: " + (reason if reason else "nein"))
+
+
+def hook(kind):
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    sid = data.get("session_id") or "unknown"
+    os.makedirs(SESS, exist_ok=True)
+    p = os.path.join(SESS, sid)
+    if kind == "end":
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+    else:
+        state = "busy" if kind == "busy" else "idle"
+        with open(p, "w") as f:
+            pid = claude_ancestor()
+            json.dump({"pid": pid, "state": state, "cwd": data.get("cwd", ""),
+                       "t": int(time.time())}, f)
+    log(f"hook {kind} session={sid[:8]} pid={claude_ancestor()}")
+    update_guard()
+    if kind == "busy":
+        return  # laufende Countdowns brechen sich selbst ab
+    maybe_start_countdown()
+
+
+def status():
+    c = conf()
+    b = busy_sessions()
+    print(f"Modus:      {c['mode']} ({LABEL.get(c['mode'], '?')})")
+    print(f"Countdown:  {c['delay']}s" + ("  [LÄUFT GERADE]" if countdown_running() else ""))
+    print(f"Arbeitende Sitzungen: {len(b)}")
+    for d in b:
+        print(f"  - pid {d['pid']}  {d.get('cwd', '')}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__); return
+    cmd = a[0]
+    if cmd == "hook" and len(a) > 1:
+        hook(a[1])
+    elif cmd == "_countdown":
+        run_countdown()
+    elif cmd in ACTIONS or cmd == "off":
+        c = conf(); c["mode"] = cmd; save_conf(c)
+        if cmd == "off":
+            cancel_countdown()
+        print(f"OK: Wenn alle Claude-Sitzungen fertig sind -> {LABEL[cmd]}" if cmd != "off"
+              else "OK: Automatik deaktiviert.")
+        log(f"mode = {cmd}")
+    elif cmd == "cancel":
+        cancel_countdown(); print("Countdown abgebrochen (Modus bleibt aktiv).")
+    elif cmd == "delay" and len(a) > 1:
+        c = conf(); c["delay"] = max(5, int(a[1])); save_conf(c); print(f"Countdown: {c['delay']}s")
+    elif cmd == "lidwatch":
+        lidwatch()
+    elif cmd == "idlewatch":
+        idlewatch()
+    elif cmd == "idle":
+        c = conf()
+        if len(a) == 1:
+            idle_status()
+        elif a[1] in ("on", "off"):
+            c["idle_enabled"] = a[1] == "on"; save_conf(c)
+            print("Leerlauf-Automatik " + ("an." if c["idle_enabled"] else "aus."))
+        elif a[1] in ("ac", "bat") and len(a) > 2:
+            c["idle_ac_min" if a[1] == "ac" else "idle_bat_min"] = max(1, int(a[2])); save_conf(c)
+            print(f"Leerlauf {'Netz' if a[1] == 'ac' else 'Akku'}: {max(1, int(a[2]))} Min")
+        else:
+            print(__doc__); sys.exit(1)
+    elif cmd == "lid" and len(a) > 1:
+        c = conf(); c["lid_minutes"] = max(0, int(a[1])); save_conf(c)
+        print("Deckel-Wächter aus." if c["lid_minutes"] == 0 else
+              f"Deckel zu + {c['lid_minutes']} Min. keine Claude-Arbeit -> {LABEL[c['lid_action']]}")
+    elif cmd == "lid-action" and len(a) > 1 and a[1] in ACTIONS:
+        c = conf(); c["lid_action"] = a[1]; save_conf(c); print(f"Nach der Deckel-Wartezeit: {LABEL[a[1]]}")
+    elif cmd == "now":
+        maybe_start_countdown(); status()
+    elif cmd == "status":
+        update_guard(); status()
+        print("Einschlaf-Sperre: " + ("AN (Laptop schläft nicht von selbst ein)" if os.path.exists(GUARD) else "aus"))
+        c = conf()
+        print("Deckel-Wächter: " + ("aus" if int(c["lid_minutes"]) == 0 else
+              f"Deckel zu + {c['lid_minutes']} Min. ohne Claude-Arbeit -> {LABEL[c['lid_action']]}"))
+        idle_status()
+    else:
+        print(__doc__); sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

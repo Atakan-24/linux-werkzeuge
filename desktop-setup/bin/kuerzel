@@ -1,0 +1,3 @@
+#!/bin/sh
+# Oeffnet den Reiter "Tastenkuerzel" im Terminal-Studio (altes Tool: xfce-shortcut-tool)
+exec /usr/local/bin/terminal-studio --kuerzel "$@"
