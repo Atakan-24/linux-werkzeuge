@@ -107,6 +107,23 @@ Jedes Modul wird mit pyflakes geprüft.
 Gefunden wurden drei Software-Angaben (Apache, HTTP-Server, WordPress), keine Lücke mit hoher Dringlichkeit.
 Das Werkzeug für bekannte Lücken fand auf dieser Maschine nichts. Das ist ein Messergebnis, kein Fehler.
 
+## Gemessene Dauern (Übungsmaschine, ein Rechner)
+
+Die Vorschau zeigt die Dauer jetzt aus Messungen statt aus Schätzungen. Gemessen wurde jeder Schritt einzeln, so wie die App ihn ausführt:
+
+| Schritt | Dauer | Erfolg |
+|---|---|---|
+| whatweb | 3.7 s | ja |
+| sslscan | 0.0 s | ja |
+| nmap | 0.1 s | ja |
+| gobuster | 6.7 s | ja |
+| nikto | 20.5 s | ja |
+| nuclei | 359.6 s | ja |
+| enum4linux | 11.1 s | ja |
+| netexec | 4.7 s | ja |
+
+Die Zeiten gelten für diese eine Testmaschine. Auf echten Netzen mit Windows-Rechnern oder großen Webseiten dauert es länger. Die Windows-Schritte liefen hier ins Leere, weil die Übungsmaschine keine Windows-Freigaben hat.
+
 ## Was bewusst nicht drin ist
 
 - Keine Zusammenstellung von Angriffsbefehlen für fremde Ziele.
