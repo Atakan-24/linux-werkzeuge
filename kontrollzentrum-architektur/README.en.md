@@ -49,6 +49,24 @@ If no authorization exists, the report says so explicitly.
 
 ![Toolbox](../bilder/kontrollzentrum/05-werkzeugkiste.png)
 
+## Scope, evidence and findings
+
+- **Scope:** At authorization time you list the IP addresses, networks or domains that may be tested. Any target outside the scope is refused before every start. An authorization can have an expiry date.
+- **Run engine:** Runs execute in the background with a queue, a time limit and cancellation (the whole process tree is stopped). Runs that were active when the app closed are marked as interrupted on the next start.
+- **Evidence log:** Every run records the command, the exit code, the time and a SHA-256 checksum of its raw output.
+- **Findings:** The output of four tools is converted into structured findings (title, severity, detail). Repeated findings across runs are merged using a fingerprint.
+- **Suggestions with reasons:** Simple rules state the next sensible step and why (for example "a web service is reachable, so check which software runs first"). There are deliberately no suggestions for attacking.
+- **Reports:** Markdown, JSON, CSV and HTML, including authorization, scope, findings and recommendations.
+
+![Findings and suggestions](../bilder/kontrollzentrum/08-befunde.png)
+
+## Test summary
+
+- **13 test areas**, including the run engine on real processes (time limit, cancellation, queue, resume), scope and authorization, the evidence log, parsers, reports in four formats and the user interface. All pass.
+- **Lab test:** A local test page that identifies itself as WordPress. Detection and suggestions are correct. Two bugs were found and fixed (color codes in tool output; a web service on an unusual port).
+- **Test against a server of my own on the internet:** The firewall only lets SSH through. The scan finds exactly that port and suggests no web step. A password test against SSH was deliberately left out, because the server locks out after failed attempts.
+- **Still open:** playbooks (fixed sequences with branches), a view to compare two states, and a measurement against a real practice machine.
+
 ## Demo sequence (one example run with sample data)
 
 | Step | Image |

@@ -71,6 +71,24 @@ Die Oberfläche ist in Module pro Ansicht aufgeteilt (Startseite und Wege, Ziele
 Gemeinsame Grundlagen stehen in einer eigenen Datei. Nicht erreichbarer Code (eine alte Kategorien-Ansicht) wurde entfernt.
 Jedes Modul wird mit pyflakes geprüft.
 
+## Umfang, Beweise und Befunde
+
+- **Umfang:** Bei der Freigabe legt man fest, welche IP-Adressen, Netze oder Domains geprüft werden dürfen. Ein Ziel außerhalb wird vor jedem Start abgelehnt. Eine Freigabe kann ein Ablaufdatum haben.
+- **Lauf-Engine:** Läufe laufen im Hintergrund, mit Warteschlange, Zeitlimit und Abbruch (der ganze Prozessbaum wird beendet). Läufe, die beim Beenden der App liefen, werden beim nächsten Start als „unterbrochen“ markiert.
+- **Beweisprotokoll:** Jeder Lauf bekommt einen Eintrag mit Befehl, Rückgabe, Zeit und SHA-256-Prüfsumme des Protokolls.
+- **Befunde:** Die Ausgabe von vier Werkzeugen wird in strukturierte Funde umgewandelt (Titel, Schweregrad, Detail). Gleiche Funde aus verschiedenen Läufen werden über einen Fingerabdruck zusammengeführt.
+- **Vorschläge mit Begründung:** Einfache Regeln sagen, welcher Schritt als Nächstes sinnvoll ist und warum (z. B. „Ein Webdienst ist erreichbar, deshalb zuerst prüfen, welche Software läuft“). Es gibt bewusst keine Vorschläge zum Angreifen.
+- **Berichte:** Markdown, JSON, CSV und HTML, mit Freigabe, Umfang, Funden und Empfehlungen.
+
+![Befunde und Vorschläge](../bilder/kontrollzentrum/08-befunde.png)
+
+## Testbericht (zusammengefasst)
+
+- **13 Prüfbereiche**, darunter Lauf-Engine (echte Prozesse: Zeitlimit, Abbruch, Warteschlange, Wiederaufnahme), Umfang und Freigabe, Beweisprotokoll, Parser, Berichte in vier Formaten und die Oberfläche. Alle grün.
+- **Labortest:** Eine lokale Testseite, die sich als WordPress ausgibt. Die Erkennung und die Vorschläge stimmen. Dabei wurden zwei Fehler gefunden und behoben (Farbcodes in der Ausgabe; ein Webdienst auf einem ungewöhnlichen Port).
+- **Test gegen einen eigenen Server aus dem Internet:** Die Firewall lässt nur SSH durch. Der Scan findet genau diesen einen Port und schlägt keinen Webschritt vor. Ein Passwort-Test gegen SSH wurde bewusst weggelassen, weil der Server nach Fehlversuchen sperrt.
+- **Noch offen:** Playbooks (feste Abfolgen mit Verzweigung), eine Ansicht für den Vergleich zweier Stände, und die Messung gegen eine richtige Übungsmaschine.
+
 ## Was bewusst nicht drin ist
 
 - Keine Zusammenstellung von Angriffsbefehlen für fremde Ziele.
